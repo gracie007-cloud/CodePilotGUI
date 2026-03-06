@@ -3,14 +3,15 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
-import { useEffect, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import type { IconSvgElement } from "@hugeicons/react";
 import {
   Message02Icon,
-  PlusSignIcon,
-  GridIcon,
+  ZapIcon,
+  Plug01Icon,
+  Image01Icon,
   Settings02Icon,
+  Wifi01Icon,
   Moon02Icon,
   Sun02Icon,
 } from "@hugeicons/core-free-icons";
@@ -21,63 +22,53 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { useTranslation } from "@/hooks/useTranslation";
+import type { TranslationKey } from "@/i18n";
+
 
 interface NavRailProps {
   chatListOpen: boolean;
   onToggleChatList: () => void;
   hasUpdate?: boolean;
+  readyToInstall?: boolean;
   skipPermissionsActive?: boolean;
 }
 
 const navItems = [
   { href: "/chat", label: "Chats", icon: Message02Icon },
-  { href: "/extensions", label: "Extensions", icon: GridIcon },
+  { href: "/skills", label: "Skills", icon: ZapIcon },
+  { href: "/mcp", label: "MCP", icon: Plug01Icon },
+  { href: "/gallery", label: "Gallery", icon: Image01Icon },
+  { href: "/bridge", label: "Bridge", icon: Wifi01Icon },
   { href: "/settings", label: "Settings", icon: Settings02Icon },
 ] as const;
 
-export function NavRail({ chatListOpen, onToggleChatList, hasUpdate, skipPermissionsActive }: NavRailProps) {
+export function NavRail({ onToggleChatList, hasUpdate, readyToInstall, skipPermissionsActive }: NavRailProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { theme, setTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
+  const { t } = useTranslation();
+  const navLabelKeys: Record<string, TranslationKey> = {
+    'Chats': 'nav.chats',
+    'Skills': 'extensions.skills',
+    'MCP': 'extensions.mcpServers',
+    'Gallery': 'gallery.title',
+    'Bridge': 'nav.bridge',
+    'Settings': 'nav.settings',
+  };
+  const emptySubscribe = useCallback(() => () => {}, []);
+  const mounted = useSyncExternalStore(emptySubscribe, () => true, () => false);
   const isChatRoute = pathname === "/chat" || pathname.startsWith("/chat/");
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
 
   return (
     <aside className="flex w-14 shrink-0 flex-col items-center bg-sidebar pb-3 pt-10">
-      {/* New Chat */}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            asChild
-            variant="ghost"
-            size="icon"
-            className="mb-2 h-9 w-9"
-          >
-            <Link href="/chat">
-              <HugeiconsIcon icon={PlusSignIcon} className="h-4 w-4" />
-              <span className="sr-only">New Chat</span>
-            </Link>
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="right">New Chat</TooltipContent>
-      </Tooltip>
-
-      {/* Divider */}
-      <div className="mx-auto mb-2 h-px w-6 bg-border/50" />
-
       {/* Nav icons */}
       <nav className="flex flex-1 flex-col items-center gap-1">
         {navItems.map((item) => {
           const isActive =
             item.href === "/chat"
               ? pathname === "/chat" || pathname.startsWith("/chat/")
-              : item.href === "/extensions"
-                ? pathname.startsWith("/extensions")
-                : pathname === item.href || pathname.startsWith(item.href + "?");
+              : pathname === item.href || pathname.startsWith(item.href + "/") || pathname.startsWith(item.href + "?");
 
           return (
             <Tooltip key={item.href}>
@@ -101,7 +92,7 @@ export function NavRail({ chatListOpen, onToggleChatList, hasUpdate, skipPermiss
                     }}
                   >
                     <HugeiconsIcon icon={item.icon} className="h-4 w-4" />
-                    <span className="sr-only">{item.label}</span>
+                    <span className="sr-only">{t(navLabelKeys[item.label] ?? item.label as TranslationKey)}</span>
                   </Button>
                 ) : (
                   <div className="relative">
@@ -116,16 +107,19 @@ export function NavRail({ chatListOpen, onToggleChatList, hasUpdate, skipPermiss
                     >
                       <Link href={item.href}>
                         <HugeiconsIcon icon={item.icon} className="h-4 w-4" />
-                        <span className="sr-only">{item.label}</span>
+                        <span className="sr-only">{t(navLabelKeys[item.label] ?? item.label as TranslationKey)}</span>
                       </Link>
                     </Button>
                     {item.href === "/settings" && hasUpdate && (
-                      <span className="absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-blue-500" />
+                      <span className={cn(
+                        "absolute top-0.5 right-0.5 h-2 w-2 rounded-full",
+                        readyToInstall ? "bg-green-500 animate-pulse" : "bg-blue-500"
+                      )} />
                     )}
                   </div>
                 )}
               </TooltipTrigger>
-              <TooltipContent side="right">{item.label}</TooltipContent>
+              <TooltipContent side="right">{t(navLabelKeys[item.label] ?? item.label as TranslationKey)}</TooltipContent>
             </Tooltip>
           );
         })}
@@ -143,7 +137,7 @@ export function NavRail({ chatListOpen, onToggleChatList, hasUpdate, skipPermiss
                 </span>
               </div>
             </TooltipTrigger>
-            <TooltipContent side="right">Auto-approve is ON</TooltipContent>
+            <TooltipContent side="right">{t('nav.autoApproveOn')}</TooltipContent>
           </Tooltip>
         )}
         {mounted && (
@@ -160,11 +154,11 @@ export function NavRail({ chatListOpen, onToggleChatList, hasUpdate, skipPermiss
                 ) : (
                   <HugeiconsIcon icon={Moon02Icon} className="h-4 w-4" />
                 )}
-                <span className="sr-only">Toggle theme</span>
+                <span className="sr-only">{t('nav.toggleTheme')}</span>
               </Button>
             </TooltipTrigger>
             <TooltipContent side="right">
-              {theme === "dark" ? "Light mode" : "Dark mode"}
+              {theme === "dark" ? t('nav.lightMode') : t('nav.darkMode')}
             </TooltipContent>
           </Tooltip>
         )}

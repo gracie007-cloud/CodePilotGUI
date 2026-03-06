@@ -30,16 +30,11 @@ export default function NewChatPage() {
   const [workingDir, setWorkingDir] = useState('');
   const [mode, setMode] = useState('code');
   const [currentModel, setCurrentModel] = useState('sonnet');
+  const [currentProviderId, setCurrentProviderId] = useState('');
   const [pendingPermission, setPendingPermission] = useState<PermissionRequestEvent | null>(null);
   const [permissionResolved, setPermissionResolved] = useState<'allow' | 'deny' | null>(null);
   const [streamingToolOutput, setStreamingToolOutput] = useState('');
   const abortControllerRef = useRef<AbortController | null>(null);
-
-  const handleWorkingDirectoryChange = useCallback((dir: string) => {
-    setWorkingDir(dir);
-    setWorkingDirectory(dir);
-    setPanelOpen(true);
-  }, [setWorkingDirectory, setPanelOpen]);
 
   const stopStreaming = useCallback(() => {
     abortControllerRef.current?.abort();
@@ -81,8 +76,22 @@ export default function NewChatPage() {
   }, [pendingPermission, setPendingApprovalSessionId]);
 
   const sendFirstMessage = useCallback(
-    async (content: string) => {
+    async (content: string, _files?: unknown, systemPromptAppend?: string) => {
       if (isStreaming) return;
+
+      // Require a project directory before sending
+      if (!workingDir.trim()) {
+        const hint: Message = {
+          id: 'hint-' + Date.now(),
+          session_id: '',
+          role: 'assistant',
+          content: '**Please select a project directory first.** Use the folder picker in the toolbar below to choose a working directory before sending a message.',
+          created_at: new Date().toISOString(),
+          token_usage: null,
+        };
+        setMessages((prev) => [...prev, hint]);
+        return;
+      }
 
       setIsStreaming(true);
       setStreamingContent('');
@@ -96,14 +105,12 @@ export default function NewChatPage() {
       let sessionId = '';
 
       try {
-        // Create a new session with optional working directory
+        // Create a new session with working directory
         const createBody: Record<string, string> = {
           title: content.slice(0, 50),
           mode,
+          working_directory: workingDir.trim(),
         };
-        if (workingDir.trim()) {
-          createBody.working_directory = workingDir.trim();
-        }
 
         const createRes = await fetch('/api/chat/sessions', {
           method: 'POST',
@@ -137,7 +144,7 @@ export default function NewChatPage() {
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: session.id, content, mode, model: currentModel }),
+          body: JSON.stringify({ session_id: session.id, content, mode, model: currentModel, provider_id: currentProviderId, ...(systemPromptAppend ? { systemPromptAppend } : {}) }),
           signal: controller.signal,
         });
 
@@ -304,7 +311,7 @@ export default function NewChatPage() {
         abortControllerRef.current = null;
       }
     },
-    [isStreaming, router, workingDir, mode, currentModel, setPendingApprovalSessionId]
+    [isStreaming, router, workingDir, mode, currentModel, currentProviderId, setPendingApprovalSessionId]
   );
 
   const handleCommand = useCallback((command: string) => {
@@ -363,8 +370,12 @@ export default function NewChatPage() {
         isStreaming={isStreaming}
         modelName={currentModel}
         onModelChange={setCurrentModel}
+        providerId={currentProviderId}
+        onProviderModelChange={(pid, model) => {
+          setCurrentProviderId(pid);
+          setCurrentModel(model);
+        }}
         workingDirectory={workingDir}
-        onWorkingDirectoryChange={handleWorkingDirectoryChange}
         mode={mode}
         onModeChange={setMode}
       />

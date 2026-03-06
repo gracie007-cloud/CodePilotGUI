@@ -1,5 +1,9 @@
 appId: com.codepilot.app
 productName: CodePilot
+publish:
+  provider: github
+  owner: op7418
+  repo: CodePilot
 directories:
   output: release
 files:
@@ -36,6 +40,7 @@ extraResources:
     to: .
     filter: ["icon.*"]
 afterPack: scripts/after-pack.js
+afterSign: scripts/after-sign.js
 asarUnpack:
   - "**/*.node"
   - "**/better-sqlite3/**"
@@ -43,9 +48,16 @@ mac:
   icon: build/icon.icns
   category: public.app-category.developer-tools
   artifactName: "${productName}-${version}-${arch}.${ext}"
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
+  notarize: false
   target:
     - target: dmg
-      arch: [arm64, x64]
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
 win:
   icon: build/icon.ico
   target:
@@ -54,9 +66,10 @@ win:
 nsis:
   oneClick: false
   perMachine: false
-  allowToChangeInstallationDirectory: true
+  allowToChangeInstallationDirectory: false
   createDesktopShortcut: true
   createStartMenuShortcut: true
+  deleteAppDataOnUninstall: false
 linux:
   icon: build/icon.png
   category: Development

@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { scanDirectory, isPathSafe } from '@/lib/files';
+import path from 'path';
+import os from 'os';
+import { scanDirectory, isPathSafe, isRootPath } from '@/lib/files';
 import type { FileTreeResponse, ErrorResponse } from '@/types';
 
 export async function GET(request: NextRequest) {
@@ -14,23 +16,21 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const path = require('path');
-  const os = require('os');
   const resolvedDir = path.resolve(dir);
   const homeDir = os.homedir();
 
   // Use baseDir (the session's working directory) as the trust boundary.
-  // The baseDir itself must be under the user's home directory to prevent
-  // attackers from setting baseDir=/ to bypass all restrictions.
-  // If no baseDir is provided, fall back to the user's home directory
-  // to prevent scanning arbitrary system directories.
+  // baseDir is the project root the user explicitly chose — it may be on
+  // a different drive than the home directory on Windows (e.g., D:\projects).
+  // We only reject root paths (/, C:\) as baseDir to prevent full-disk scans.
+  // If no baseDir is provided, fall back to the user's home directory.
   const baseDir = searchParams.get('baseDir');
   if (baseDir) {
     const resolvedBase = path.resolve(baseDir);
-    // Ensure baseDir is within the home directory (prevent baseDir=/ bypass)
-    if (!isPathSafe(homeDir, resolvedBase)) {
+    // Prevent using a filesystem root as baseDir (e.g., /, C:\)
+    if (isRootPath(resolvedBase)) {
       return NextResponse.json<ErrorResponse>(
-        { error: 'Base directory is outside the allowed scope' },
+        { error: 'Cannot use filesystem root as base directory' },
         { status: 403 }
       );
     }
@@ -52,7 +52,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const tree = scanDirectory(resolvedDir, Math.min(depth, 5));
+    const tree = await scanDirectory(resolvedDir, Math.min(depth, 5));
     return NextResponse.json<FileTreeResponse>({ tree, root: resolvedDir });
   } catch (error) {
     return NextResponse.json<ErrorResponse>(

@@ -1,5 +1,8 @@
 /**
- * Smoke test script -- run with: npx tsx src/__tests__/smoke-test.ts
+ * @deprecated Use the Playwright version instead: npx playwright test --grep @smoke
+ * See: src/__tests__/e2e/smoke.spec.ts
+ *
+ * Legacy smoke test script -- run with: npx tsx src/__tests__/smoke-test.ts
  * Tests basic page rendering for all routes.
  */
 import { chromium } from 'playwright';
@@ -78,9 +81,9 @@ async function runSmokeTests() {
       await page.screenshot({ path: `/Users/op7418/Documents/code/opus-4.6-test/src/__tests__/screenshots/${screenshotName}.png`, fullPage: true });
 
       results.push({ name: route.name, status: 'PASS', details, consoleErrors, loadTimeMs: elapsed });
-    } catch (err: any) {
+    } catch (err: unknown) {
       const elapsed = Date.now() - start;
-      results.push({ name: route.name, status: 'FAIL', details: err.message, consoleErrors, loadTimeMs: elapsed });
+      results.push({ name: route.name, status: 'FAIL', details: err instanceof Error ? err.message : String(err), consoleErrors, loadTimeMs: elapsed });
     }
     await page.close();
   }

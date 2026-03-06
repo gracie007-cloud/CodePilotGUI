@@ -15,6 +15,12 @@ export interface ChatSession {
   status: 'active' | 'archived';
   mode?: 'code' | 'plan' | 'ask';
   needs_approval?: boolean;
+  provider_name: string;
+  provider_id: string;
+  sdk_cwd: string;
+  runtime_status: string;
+  runtime_updated_at: string;
+  runtime_error: string;
 }
 
 // ==========================================
@@ -56,6 +62,7 @@ export interface TaskItem {
   title: string;
   status: TaskStatus;
   description: string | null;
+  source: 'user' | 'sdk';
   created_at: string;
   updated_at: string;
 }
@@ -111,6 +118,13 @@ export interface ApiProvider {
   updated_at: string;
 }
 
+export interface ProviderModelGroup {
+  provider_id: string;       // provider DB id, or 'env' for environment variables
+  provider_name: string;
+  provider_type: string;
+  models: Array<{ value: string; label: string }>;
+}
+
 export interface CreateProviderRequest {
   name: string;
   provider_type?: string;
@@ -160,6 +174,7 @@ export interface CreateSessionRequest {
   system_prompt?: string;
   working_directory?: string;
   mode?: string;
+  provider_id?: string;
 }
 
 export interface SendMessageRequest {
@@ -167,6 +182,7 @@ export interface SendMessageRequest {
   content: string;
   model?: string;
   mode?: string;
+  provider_id?: string;
 }
 
 export interface UpdateMCPConfigRequest {
@@ -217,6 +233,33 @@ export interface SkillDefinition {
   enabled: boolean;
 }
 
+// --- Marketplace (Skills.sh) ---
+
+export interface MarketplaceSkill {
+  id: string;
+  skillId: string;      // e.g. "git-commit"
+  name: string;
+  installs: number;
+  source: string;       // e.g. "owner/repo"
+  isInstalled?: boolean;
+  installedAt?: string;
+}
+
+export interface SkillLockFile {
+  version: number;
+  skills: Record<string, SkillLockEntry>;
+}
+
+export interface SkillLockEntry {
+  source: string;
+  sourceType: string;
+  sourceUrl: string;
+  skillPath?: string;
+  skillFolderHash: string;
+  installedAt: string;
+  updatedAt: string;
+}
+
 export interface CreateSkillRequest {
   name: string;
   description: string;
@@ -243,6 +286,7 @@ export interface SessionResponse {
 
 export interface MessagesResponse {
   messages: Message[];
+  hasMore?: boolean;
 }
 
 export interface SuccessResponse {
@@ -305,10 +349,14 @@ export type SSEEventType =
   | 'tool_use'           // tool invocation info
   | 'tool_result'        // tool execution result
   | 'tool_output'        // streaming tool output (stderr from SDK process)
+  | 'tool_timeout'       // tool execution timed out
   | 'status'             // status update (compacting, etc.)
   | 'result'             // final result with usage stats
   | 'error'              // error occurred
   | 'permission_request' // permission approval needed
+  | 'mode_changed'       // SDK permission mode changed (e.g. plan → code)
+  | 'task_update'        // SDK TodoWrite task sync
+  | 'keep_alive'         // SDK keep-alive heartbeat (resets idle timer)
   | 'done';              // stream complete
 
 export interface SSEEvent {
@@ -343,6 +391,7 @@ export interface PermissionResponseRequest {
   decision: {
     behavior: 'allow';
     updatedPermissions?: PermissionSuggestion[];
+    updatedInput?: Record<string, unknown>;
   } | {
     behavior: 'deny';
     message?: string;
@@ -393,6 +442,16 @@ export const SETTING_KEYS = {
 } as const;
 
 // ==========================================
+// Reference Image Types (for image generation)
+// ==========================================
+
+export interface ReferenceImage {
+  mimeType: string;
+  data?: string;       // base64 (user upload)
+  localPath?: string;  // file path (generated result)
+}
+
+// ==========================================
 // File Attachment Types
 // ==========================================
 
@@ -421,6 +480,188 @@ export function formatFileSize(bytes: number): string {
 // Claude Client Types
 // ==========================================
 
+// ==========================================
+// Batch Image Generation Types
+// ==========================================
+
+export type MediaJobStatus = 'draft' | 'planning' | 'planned' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed';
+export type MediaJobItemStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+
+export interface MediaJob {
+  id: string;
+  session_id: string | null;
+  status: MediaJobStatus;
+  doc_paths: string;       // JSON array of file paths
+  style_prompt: string;
+  batch_config: string;    // JSON of BatchConfig
+  total_items: number;
+  completed_items: number;
+  failed_items: number;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface MediaJobItem {
+  id: string;
+  job_id: string;
+  idx: number;
+  prompt: string;
+  aspect_ratio: string;
+  image_size: string;
+  model: string;
+  tags: string;            // JSON array of strings
+  source_refs: string;     // JSON array of strings
+  status: MediaJobItemStatus;
+  retry_count: number;
+  result_media_generation_id: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MediaContextEvent {
+  id: string;
+  session_id: string;
+  job_id: string;
+  payload: string;         // JSON object
+  sync_mode: 'manual' | 'auto_batch';
+  synced_at: string | null;
+  created_at: string;
+}
+
+export interface BatchConfig {
+  concurrency: number;     // max parallel image generations (default: 2)
+  maxRetries: number;      // max retry attempts per item (default: 2)
+  retryDelayMs: number;    // base delay for exponential backoff (default: 2000)
+}
+
+export interface PlannerItem {
+  prompt: string;
+  aspectRatio: string;
+  resolution: string;
+  tags: string[];
+  sourceRefs: string[];
+}
+
+export interface PlannerOutput {
+  summary: string;
+  items: PlannerItem[];
+}
+
+export type JobProgressEventType =
+  | 'item_started'
+  | 'item_completed'
+  | 'item_failed'
+  | 'item_retry'
+  | 'job_completed'
+  | 'job_paused'
+  | 'job_cancelled';
+
+export interface JobProgressEvent {
+  type: JobProgressEventType;
+  jobId: string;
+  itemId?: string;
+  itemIdx?: number;
+  progress: {
+    total: number;
+    completed: number;
+    failed: number;
+    processing: number;
+  };
+  error?: string;
+  retryCount?: number;
+  mediaGenerationId?: string;
+  timestamp: string;
+}
+
+// --- Batch Image Gen API Types ---
+
+export interface CreateMediaJobRequest {
+  sessionId?: string;
+  items: Array<{
+    prompt: string;
+    aspectRatio?: string;
+    imageSize?: string;
+    model?: string;
+    tags?: string[];
+    sourceRefs?: string[];
+  }>;
+  batchConfig?: Partial<BatchConfig>;
+  stylePrompt?: string;
+  docPaths?: string[];
+}
+
+export interface PlanMediaJobRequest {
+  docPaths?: string[];
+  docContent?: string;
+  stylePrompt: string;
+  sessionId?: string;
+  count?: number;
+}
+
+export interface UpdateMediaJobItemsRequest {
+  items: Array<{
+    id: string;
+    prompt?: string;
+    aspectRatio?: string;
+    imageSize?: string;
+    tags?: string[];
+  }>;
+}
+
+export interface MediaJobResponse {
+  job: MediaJob;
+  items: MediaJobItem[];
+}
+
+export interface MediaJobListResponse {
+  jobs: MediaJob[];
+}
+
+// ==========================================
+// Stream Session Manager Types
+// ==========================================
+
+export interface ToolUseInfo {
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+export interface ToolResultInfo {
+  tool_use_id: string;
+  content: string;
+}
+
+export type StreamPhase = 'active' | 'completed' | 'error' | 'stopped';
+
+export interface SessionStreamSnapshot {
+  sessionId: string;
+  phase: StreamPhase;
+  streamingContent: string;
+  toolUses: ToolUseInfo[];
+  toolResults: ToolResultInfo[];
+  streamingToolOutput: string;
+  statusText: string | undefined;
+  pendingPermission: PermissionRequestEvent | null;
+  permissionResolved: 'allow' | 'deny' | null;
+  tokenUsage: TokenUsage | null;
+  startedAt: number;
+  completedAt: number | null;
+  error: string | null;
+  /** Final message content built at stream completion for ChatView to consume */
+  finalMessageContent: string | null;
+}
+
+export interface StreamEvent {
+  type: 'snapshot-updated' | 'phase-changed' | 'permission-request' | 'completed';
+  sessionId: string;
+  snapshot: SessionStreamSnapshot;
+}
+
+export type StreamEventListener = (event: StreamEvent) => void;
+
 export interface ClaudeStreamOptions {
   prompt: string;
   sessionId: string;
@@ -432,4 +673,10 @@ export interface ClaudeStreamOptions {
   abortController?: AbortController;
   permissionMode?: string;
   files?: FileAttachment[];
+  imageAgentMode?: boolean;
+  toolTimeoutSeconds?: number;
+  provider?: ApiProvider;
+  /** Recent conversation history from DB — used as fallback context when SDK resume is unavailable or fails */
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  onRuntimeStatusChange?: (status: string) => void;
 }

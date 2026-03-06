@@ -1,4 +1,4 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import type { FileTreeNode, FilePreview } from '@/types';
 
@@ -74,22 +74,33 @@ export function isPathSafe(basePath: string, targetPath: string): boolean {
   return resolvedTarget.startsWith(resolvedBase + path.sep) || resolvedTarget === resolvedBase;
 }
 
-export function scanDirectory(dir: string, depth: number = 3): FileTreeNode[] {
+/**
+ * Check if a path is a filesystem root (e.g., `/`, `C:\`, `D:\`).
+ * Used to prevent using root as a baseDir for file browsing.
+ */
+export function isRootPath(p: string): boolean {
+  const resolved = path.resolve(p);
+  return resolved === path.parse(resolved).root;
+}
+
+export async function scanDirectory(dir: string, depth: number = 3): Promise<FileTreeNode[]> {
   const resolvedDir = path.resolve(dir);
 
-  if (!fs.existsSync(resolvedDir)) {
+  try {
+    await fs.access(resolvedDir);
+  } catch {
     return [];
   }
 
   return scanDirectoryRecursive(resolvedDir, depth);
 }
 
-function scanDirectoryRecursive(dir: string, depth: number): FileTreeNode[] {
+async function scanDirectoryRecursive(dir: string, depth: number): Promise<FileTreeNode[]> {
   if (depth <= 0) return [];
 
-  let entries: fs.Dirent[];
+  let entries: import('fs').Dirent[];
   try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
+    entries = await fs.readdir(dir, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -114,7 +125,7 @@ function scanDirectoryRecursive(dir: string, depth: number): FileTreeNode[] {
     if (entry.isDirectory()) {
       if (IGNORED_DIRS.has(entry.name)) continue;
 
-      const children = scanDirectoryRecursive(fullPath, depth - 1);
+      const children = await scanDirectoryRecursive(fullPath, depth - 1);
       nodes.push({
         name: entry.name,
         path: fullPath,
@@ -125,7 +136,7 @@ function scanDirectoryRecursive(dir: string, depth: number): FileTreeNode[] {
       const ext = path.extname(entry.name).replace(/^\./, '');
       let size: number | undefined;
       try {
-        const stat = fs.statSync(fullPath);
+        const stat = await fs.stat(fullPath);
         size = stat.size;
       } catch {
         // Skip files we can't stat
@@ -144,20 +155,22 @@ function scanDirectoryRecursive(dir: string, depth: number): FileTreeNode[] {
   return nodes;
 }
 
-export function readFilePreview(filePath: string, maxLines: number = 200): FilePreview {
+export async function readFilePreview(filePath: string, maxLines: number = 200): Promise<FilePreview> {
   const resolvedPath = path.resolve(filePath);
 
-  if (!fs.existsSync(resolvedPath)) {
+  try {
+    await fs.access(resolvedPath);
+  } catch {
     throw new Error(`File not found: ${filePath}`);
   }
 
-  const stat = fs.statSync(resolvedPath);
+  const stat = await fs.stat(resolvedPath);
   if (!stat.isFile()) {
     throw new Error(`Not a file: ${filePath}`);
   }
 
   // Read the file content, limiting to maxLines
-  const content = fs.readFileSync(resolvedPath, 'utf-8');
+  const content = await fs.readFile(resolvedPath, 'utf-8');
   const lines = content.split('\n');
   const truncated = lines.slice(0, maxLines).join('\n');
 

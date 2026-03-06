@@ -1,7 +1,9 @@
 import { NextRequest } from 'next/server';
 import { streamClaude } from '@/lib/claude-client';
-import { addMessage, getSession, updateSessionTitle, updateSdkSessionId, getSetting } from '@/lib/db';
+import { addMessage, getMessages, getSession, updateSessionTitle, updateSdkSessionId, updateSessionModel, updateSessionProvider, updateSessionProviderId, getSetting, getProvider, getDefaultProviderId, acquireSessionLock, renewSessionLock, releaseSessionLock, setSessionRuntimeStatus, syncSdkTasks } from '@/lib/db';
+import { notifySessionStart, notifySessionComplete, notifySessionError } from '@/lib/telegram-bot';
 import type { SendMessageRequest, SSEEvent, TokenUsage, MessageContentBlock, FileAttachment } from '@/types';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -9,9 +11,15 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: NextRequest) {
+  let activeSessionId: string | undefined;
+  let activeLockId: string | undefined;
+
   try {
-    const body: SendMessageRequest & { files?: FileAttachment[] } = await request.json();
-    const { session_id, content, model, mode, files } = body;
+    const body: SendMessageRequest & { files?: FileAttachment[]; toolTimeout?: number; provider_id?: string; systemPromptAppend?: string } = await request.json();
+    const { session_id, content, model, mode, files, toolTimeout, provider_id, systemPromptAppend } = body;
+
+    console.log('[chat API] content length:', content.length, 'first 200 chars:', content.slice(0, 200));
+    console.log('[chat API] systemPromptAppend:', systemPromptAppend ? `${systemPromptAppend.length} chars` : 'none');
 
     if (!session_id || !content) {
       return new Response(JSON.stringify({ error: 'session_id and content are required' }), {
@@ -28,15 +36,37 @@ export async function POST(request: NextRequest) {
       });
     }
 
+    // Acquire exclusive lock for this session to prevent concurrent requests
+    const lockId = crypto.randomBytes(8).toString('hex');
+    const lockAcquired = acquireSessionLock(session_id, lockId, `chat-${process.pid}`, 600);
+    if (!lockAcquired) {
+      return new Response(
+        JSON.stringify({ error: 'Session is busy processing another request', code: 'SESSION_BUSY' }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    activeSessionId = session_id;
+    activeLockId = lockId;
+    setSessionRuntimeStatus(session_id, 'running');
+
+    // Telegram notification: session started (fire-and-forget)
+    const telegramNotifyOpts = {
+      sessionId: session_id,
+      sessionTitle: session.title !== 'New Chat' ? session.title : content.slice(0, 50),
+      workingDirectory: session.working_directory,
+    };
+    notifySessionStart(telegramNotifyOpts).catch(() => {});
+
     // Save user message — persist file metadata so attachments survive page reload
     let savedContent = content;
+    let fileMeta: Array<{ id: string; name: string; type: string; size: number; filePath: string }> | undefined;
     if (files && files.length > 0) {
-      const workDir = session.working_directory || process.cwd();
+      const workDir = session.working_directory;
       const uploadDir = path.join(workDir, '.codepilot-uploads');
       if (!fs.existsSync(uploadDir)) {
         fs.mkdirSync(uploadDir, { recursive: true });
       }
-      const fileMeta = files.map((f) => {
+      fileMeta = files.map((f) => {
         const safeName = path.basename(f.name).replace(/[^a-zA-Z0-9._-]/g, '_');
         const filePath = path.join(uploadDir, `${Date.now()}-${safeName}`);
         const buffer = Buffer.from(f.data, 'base64');
@@ -55,6 +85,42 @@ export async function POST(request: NextRequest) {
 
     // Determine model: request override > session model > default setting
     const effectiveModel = model || session.model || getSetting('default_model') || undefined;
+
+    // Persist model and provider to session so usage stats can group by model+provider.
+    // This runs on every message but the DB writes are cheap (single UPDATE by PK).
+    if (effectiveModel && effectiveModel !== session.model) {
+      updateSessionModel(session_id, effectiveModel);
+    }
+
+    // Resolve provider: explicit provider_id > default_provider_id > environment variables
+    let resolvedProvider: import('@/types').ApiProvider | undefined;
+    const effectiveProviderId = provider_id || session.provider_id || '';
+    if (effectiveProviderId && effectiveProviderId !== 'env') {
+      resolvedProvider = getProvider(effectiveProviderId);
+      if (!resolvedProvider) {
+        // Requested provider not found, try default
+        const defaultId = getDefaultProviderId();
+        if (defaultId) {
+          resolvedProvider = getProvider(defaultId);
+        }
+      }
+    } else if (!effectiveProviderId) {
+      // No provider specified, try default
+      const defaultId = getDefaultProviderId();
+      if (defaultId) {
+        resolvedProvider = getProvider(defaultId);
+      }
+    }
+    // effectiveProviderId === 'env' → resolvedProvider stays undefined → uses env vars
+
+    const providerName = resolvedProvider?.name || '';
+    if (providerName !== (session.provider_name || '')) {
+      updateSessionProvider(session_id, providerName);
+    }
+    const persistProviderId = effectiveProviderId || provider_id || '';
+    if (persistProviderId !== (session.provider_id || '')) {
+      updateSessionProviderId(session_id, persistProviderId);
+    }
 
     // Determine permission mode from chat mode: code → acceptEdits, plan → plan, ask → default (no tools)
     const effectiveMode = mode || session.mode || 'code';
@@ -81,35 +147,80 @@ export async function POST(request: NextRequest) {
       abortController.abort();
     });
 
-    // Convert file attachments to the format expected by streamClaude
+    // Convert file attachments to the format expected by streamClaude.
+    // Include filePath from the already-saved files so claude-client can
+    // reference the on-disk copies instead of writing them again.
     const fileAttachments: FileAttachment[] | undefined = files && files.length > 0
-      ? files.map((f, i) => ({
-          id: f.id || `file-${Date.now()}-${i}`,
-          name: f.name,
-          type: f.type,
-          size: f.size,
-          data: f.data,
-        }))
+      ? files.map((f, i) => {
+          const meta = fileMeta?.find((m: { id: string }) => m.id === f.id);
+          return {
+            id: f.id || `file-${Date.now()}-${i}`,
+            name: f.name,
+            type: f.type,
+            size: f.size,
+            data: (meta?.filePath && !f.type.startsWith('image/')) ? '' : f.data, // Keep base64 for images (needed for vision); clear for non-images (read from disk)
+            filePath: meta?.filePath,
+          };
+        })
       : undefined;
 
+    // Append per-request system prompt (e.g. skill injection for image generation)
+    let finalSystemPrompt = systemPromptOverride || session.system_prompt || undefined;
+    if (systemPromptAppend) {
+      finalSystemPrompt = (finalSystemPrompt || '') + '\n\n' + systemPromptAppend;
+    }
+
+    // Load recent conversation history from DB as fallback context.
+    // This is used when SDK session resume is unavailable or fails,
+    // so the model still has conversation context.
+    const { messages: recentMsgs } = getMessages(session_id, { limit: 50 });
+    // Exclude the user message we just saved (last in the list) — it's already the prompt
+    const historyMsgs = recentMsgs.slice(0, -1).map(m => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content,
+    }));
+
     // Stream Claude response, using SDK session ID for resume if available
+    console.log('[chat API] streamClaude params:', {
+      promptLength: content.length,
+      promptFirst200: content.slice(0, 200),
+      sdkSessionId: session.sdk_session_id || 'none',
+      systemPromptLength: finalSystemPrompt?.length || 0,
+      systemPromptFirst200: finalSystemPrompt?.slice(0, 200) || 'none',
+    });
     const stream = streamClaude({
       prompt: content,
       sessionId: session_id,
       sdkSessionId: session.sdk_session_id || undefined,
       model: effectiveModel,
-      systemPrompt: systemPromptOverride || session.system_prompt || undefined,
-      workingDirectory: session.working_directory || undefined,
+      systemPrompt: finalSystemPrompt,
+      workingDirectory: session.sdk_cwd || session.working_directory || undefined,
       abortController,
       permissionMode,
       files: fileAttachments,
+      imageAgentMode: !!systemPromptAppend,
+      toolTimeoutSeconds: toolTimeout || 300,
+      provider: resolvedProvider,
+      conversationHistory: historyMsgs,
+      onRuntimeStatusChange: (status: string) => {
+        try { setSessionRuntimeStatus(session_id, status); } catch { /* best effort */ }
+      },
     });
 
     // Tee the stream: one for client, one for collecting the response
     const [streamForClient, streamForCollect] = stream.tee();
 
-    // Save assistant message in background
-    collectStreamResponse(streamForCollect, session_id);
+    // Periodically renew the session lock so long-running tasks don't expire
+    const lockRenewalInterval = setInterval(() => {
+      try { renewSessionLock(session_id, lockId, 600); } catch { /* best effort */ }
+    }, 60_000);
+
+    // Save assistant message in background, with cleanup callback to release lock
+    collectStreamResponse(streamForCollect, session_id, telegramNotifyOpts, () => {
+      clearInterval(lockRenewalInterval);
+      releaseSessionLock(session_id, lockId);
+      setSessionRuntimeStatus(session_id, 'idle');
+    });
 
     return new Response(streamForClient, {
       headers: {
@@ -119,6 +230,14 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
+    // Release lock and reset status on error (only if lock was acquired)
+    if (activeSessionId && activeLockId) {
+      try {
+        releaseSessionLock(activeSessionId, activeLockId);
+        setSessionRuntimeStatus(activeSessionId, 'idle', error instanceof Error ? error.message : 'Unknown error');
+      } catch { /* best effort */ }
+    }
+
     const message = error instanceof Error ? error.message : 'Internal server error';
     return new Response(JSON.stringify({ error: message }), {
       status: 500,
@@ -127,11 +246,20 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function collectStreamResponse(stream: ReadableStream<string>, sessionId: string) {
+async function collectStreamResponse(
+  stream: ReadableStream<string>,
+  sessionId: string,
+  telegramOpts: { sessionId?: string; sessionTitle?: string; workingDirectory?: string },
+  onComplete?: () => void,
+) {
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
   let currentText = '';
   let tokenUsage: TokenUsage | null = null;
+  let hasError = false;
+  let errorMessage = '';
+  // Dedup layer: skip duplicate tool_result events by tool_use_id
+  const seenToolResultIds = new Set<string>();
 
   try {
     while (true) {
@@ -167,30 +295,62 @@ async function collectStreamResponse(stream: ReadableStream<string>, sessionId: 
             } else if (event.type === 'tool_result') {
               try {
                 const resultData = JSON.parse(event.data);
-                contentBlocks.push({
-                  type: 'tool_result',
+                const newBlock = {
+                  type: 'tool_result' as const,
                   tool_use_id: resultData.tool_use_id,
                   content: resultData.content,
                   is_error: resultData.is_error || false,
-                });
+                };
+                // Last-wins: if same tool_use_id already exists, replace it
+                // (user handler's result may be more complete than PostToolUse's)
+                if (seenToolResultIds.has(resultData.tool_use_id)) {
+                  const idx = contentBlocks.findIndex(
+                    (b) => b.type === 'tool_result' && 'tool_use_id' in b && b.tool_use_id === resultData.tool_use_id
+                  );
+                  if (idx >= 0) {
+                    contentBlocks[idx] = newBlock;
+                  }
+                } else {
+                  seenToolResultIds.add(resultData.tool_use_id);
+                  contentBlocks.push(newBlock);
+                }
               } catch {
                 // skip malformed tool_result data
               }
             } else if (event.type === 'status') {
-              // Capture SDK session_id from init event and persist it
+              // Capture SDK session_id and model from init event and persist them
               try {
                 const statusData = JSON.parse(event.data);
                 if (statusData.session_id) {
                   updateSdkSessionId(sessionId, statusData.session_id);
                 }
+                if (statusData.model) {
+                  updateSessionModel(sessionId, statusData.model);
+                }
               } catch {
                 // skip malformed status data
               }
+            } else if (event.type === 'task_update') {
+              // Sync SDK TodoWrite tasks to local DB
+              try {
+                const taskData = JSON.parse(event.data);
+                if (taskData.session_id && taskData.todos) {
+                  syncSdkTasks(taskData.session_id, taskData.todos);
+                }
+              } catch {
+                // skip malformed task_update data
+              }
+            } else if (event.type === 'error') {
+              hasError = true;
+              errorMessage = event.data || 'Unknown error';
             } else if (event.type === 'result') {
               try {
                 const resultData = JSON.parse(event.data);
                 if (resultData.usage) {
                   tokenUsage = resultData.usage;
+                }
+                if (resultData.is_error) {
+                  hasError = true;
                 }
                 // Also capture session_id from result if we missed it from init
                 if (resultData.session_id) {
@@ -237,7 +397,9 @@ async function collectStreamResponse(stream: ReadableStream<string>, sessionId: 
         );
       }
     }
-  } catch {
+  } catch (e) {
+    hasError = true;
+    errorMessage = e instanceof Error ? e.message : 'Stream reading error';
     // Stream reading error - best effort save
     if (currentText.trim()) {
       contentBlocks.push({ type: 'text', text: currentText });
@@ -257,5 +419,19 @@ async function collectStreamResponse(stream: ReadableStream<string>, sessionId: 
         addMessage(sessionId, 'assistant', content);
       }
     }
+  } finally {
+    // Telegram notifications: completion or error (fire-and-forget)
+    if (hasError) {
+      notifySessionError(errorMessage, telegramOpts).catch(() => {});
+    } else {
+      // Extract text summary for the completion notification
+      const textSummary = contentBlocks
+        .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text)
+        .join('')
+        .trim();
+      notifySessionComplete(textSummary || undefined, telegramOpts).catch(() => {});
+    }
+    onComplete?.();
   }
 }

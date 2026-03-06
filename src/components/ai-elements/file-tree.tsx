@@ -8,12 +8,14 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
+import { HugeiconsIcon } from "@hugeicons/react";
 import {
-  ChevronRightIcon,
-  FileIcon,
-  FolderIcon,
+  Folder01Icon,
   FolderOpenIcon,
-} from "lucide-react";
+  File01Icon,
+  ArrowRight01Icon,
+  PlusSignIcon,
+} from "@hugeicons/core-free-icons";
 import {
   createContext,
   useCallback,
@@ -27,6 +29,7 @@ interface FileTreeContextType {
   togglePath: (path: string) => void;
   selectedPath?: string;
   onSelect?: (path: string) => void;
+  onAdd?: (path: string) => void;
 }
 
 // Default noop for context default value
@@ -44,6 +47,7 @@ export type FileTreeProps = HTMLAttributes<HTMLDivElement> & {
   defaultExpanded?: Set<string>;
   selectedPath?: string;
   onSelect?: (path: string) => void;
+  onAdd?: (path: string) => void;
   onExpandedChange?: (expanded: Set<string>) => void;
 };
 
@@ -52,6 +56,7 @@ export const FileTree = ({
   defaultExpanded = new Set(),
   selectedPath,
   onSelect,
+  onAdd,
   onExpandedChange,
   className,
   children,
@@ -75,8 +80,8 @@ export const FileTree = ({
   );
 
   const contextValue = useMemo(
-    () => ({ expandedPaths, onSelect, selectedPath, togglePath }),
-    [expandedPaths, onSelect, selectedPath, togglePath]
+    () => ({ expandedPaths, onAdd, onSelect, selectedPath, togglePath }),
+    [expandedPaths, onAdd, onSelect, selectedPath, togglePath]
   );
 
   return (
@@ -119,18 +124,13 @@ export const FileTreeFolder = ({
   children,
   ...props
 }: FileTreeFolderProps) => {
-  const { expandedPaths, togglePath, selectedPath, onSelect } =
+  const { expandedPaths, togglePath } =
     useContext(FileTreeContext);
   const isExpanded = expandedPaths.has(path);
-  const isSelected = selectedPath === path;
 
-  const handleOpenChange = useCallback(() => {
+  const handleToggle = useCallback(() => {
     togglePath(path);
   }, [togglePath, path]);
-
-  const handleSelect = useCallback(() => {
-    onSelect?.(path);
-  }, [onSelect, path]);
 
   const folderContextValue = useMemo(
     () => ({ isExpanded, name, path }),
@@ -139,38 +139,40 @@ export const FileTreeFolder = ({
 
   return (
     <FileTreeFolderContext.Provider value={folderContextValue}>
-      <Collapsible onOpenChange={handleOpenChange} open={isExpanded}>
+      <Collapsible onOpenChange={handleToggle} open={isExpanded}>
         <div
           className={cn("", className)}
           role="treeitem"
           tabIndex={0}
           {...props}
         >
-          <CollapsibleTrigger asChild>
-            <button
-              className={cn(
-                "flex w-full items-center gap-1 rounded px-2 py-1 text-left transition-colors hover:bg-muted/50",
-                isSelected && "bg-muted"
+          <div
+            className="flex w-full items-center gap-1 rounded px-2 py-1 text-left transition-colors hover:bg-muted/50"
+          >
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="shrink-0 rounded p-0.5 hover:bg-muted"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <HugeiconsIcon
+                  icon={ArrowRight01Icon}
+                  className={cn(
+                    "size-4 text-muted-foreground transition-transform",
+                    isExpanded && "rotate-90"
+                  )}
+                />
+              </button>
+            </CollapsibleTrigger>
+            <FileTreeIcon>
+              {isExpanded ? (
+                <HugeiconsIcon icon={FolderOpenIcon} className="size-4 text-muted-foreground" />
+              ) : (
+                <HugeiconsIcon icon={Folder01Icon} className="size-4 text-muted-foreground" />
               )}
-              onClick={handleSelect}
-              type="button"
-            >
-              <ChevronRightIcon
-                className={cn(
-                  "size-4 shrink-0 text-muted-foreground transition-transform",
-                  isExpanded && "rotate-90"
-                )}
-              />
-              <FileTreeIcon>
-                {isExpanded ? (
-                  <FolderOpenIcon className="size-4 text-blue-500" />
-                ) : (
-                  <FolderIcon className="size-4 text-blue-500" />
-                )}
-              </FileTreeIcon>
-              <FileTreeName>{name}</FileTreeName>
-            </button>
-          </CollapsibleTrigger>
+            </FileTreeIcon>
+            <FileTreeName>{name}</FileTreeName>
+          </div>
           <CollapsibleContent>
             <div className="ml-4 border-l pl-2">{children}</div>
           </CollapsibleContent>
@@ -204,7 +206,7 @@ export const FileTreeFile = ({
   children,
   ...props
 }: FileTreeFileProps) => {
-  const { selectedPath, onSelect } = useContext(FileTreeContext);
+  const { selectedPath, onSelect, onAdd } = useContext(FileTreeContext);
   const isSelected = selectedPath === path;
 
   const handleClick = useCallback(() => {
@@ -220,13 +222,21 @@ export const FileTreeFile = ({
     [onSelect, path]
   );
 
+  const handleAdd = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      onAdd?.(path);
+    },
+    [onAdd, path]
+  );
+
   const fileContextValue = useMemo(() => ({ name, path }), [name, path]);
 
   return (
     <FileTreeFileContext.Provider value={fileContextValue}>
       <div
         className={cn(
-          "flex cursor-pointer items-center gap-1 rounded px-2 py-1 transition-colors hover:bg-muted/50",
+          "group/file flex cursor-pointer items-center gap-1 rounded px-2 py-1 transition-colors hover:bg-muted/50",
           isSelected && "bg-muted",
           className
         )}
@@ -238,12 +248,20 @@ export const FileTreeFile = ({
       >
         {children ?? (
           <>
-            {/* Spacer for alignment */}
-            <span className="size-4" />
             <FileTreeIcon>
-              {icon ?? <FileIcon className="size-4 text-muted-foreground" />}
+              {icon ?? <HugeiconsIcon icon={File01Icon} className="size-4 text-muted-foreground" />}
             </FileTreeIcon>
             <FileTreeName>{name}</FileTreeName>
+            {onAdd && (
+              <button
+                type="button"
+                className="ml-auto flex size-5 shrink-0 items-center justify-center rounded opacity-0 transition-opacity hover:bg-muted group-hover/file:opacity-100"
+                onClick={handleAdd}
+                title="Add to chat"
+              >
+                <HugeiconsIcon icon={PlusSignIcon} className="size-3 text-muted-foreground" />
+              </button>
+            )}
           </>
         )}
       </div>

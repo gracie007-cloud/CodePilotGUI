@@ -1,13 +1,19 @@
 <img src="docs/icon-readme.png" width="32" height="32" alt="CodePilot" style="vertical-align: middle; margin-right: 8px;" /> CodePilot
 ===
 
-**Claude Code 的原生桌面客户端** -- 通过可视化界面进行对话、编码和项目管理，无需在终端中操作。
+**Claude Code 的桌面 GUI 客户端** -- 通过可视化界面进行对话、编码和项目管理，无需在终端中操作。
 
 [English](./README.md) | [日本語](./README_JA.md)
 
 [![GitHub release](https://img.shields.io/github/v/release/op7418/CodePilot)](https://github.com/op7418/CodePilot/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/op7418/CodePilot/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+### 加入用户群
+
+<img src="docs/wechat-group-qr.png" width="240" alt="微信用户群二维码" />
+
+扫描二维码加入微信用户群，交流使用心得、反馈问题和获取最新动态。
 
 ---
 
@@ -25,10 +31,10 @@
 - **自定义技能** -- 定义可复用的提示词技能（全局或项目级别），在聊天中作为斜杠命令调用
 - **设置编辑器** -- 可视化和 JSON 编辑器管理 `~/.claude/settings.json`，包括权限和环境变量配置
 - **Token 用量追踪** -- 每次助手回复后查看输入/输出 Token 数量和预估费用
-- **自动更新检查** -- 应用定期检查新版本并在有更新时通知你
+- **自动更新** -- 已签名版本支持应用内自动下载和安装更新；未签名本地构建仅支持手动下载
 - **深色/浅色主题** -- 导航栏一键切换主题
 - **斜杠命令** -- 内置 `/help`、`/clear`、`/cost`、`/compact`、`/doctor`、`/review` 等命令
-- **Electron 打包** -- 原生桌面应用，隐藏标题栏，内置 Next.js 服务器，优雅关闭进程，自动端口分配
+- **Electron 打包** -- 桌面应用，隐藏标题栏，内置 Next.js 服务器，优雅关闭进程，自动端口分配
 
 ---
 
@@ -64,6 +70,7 @@ npm install
 npm run dev
 
 # -- 或者启动完整的 Electron 桌面应用 --
+node scripts/build-electron.mjs   # 编译 Electron 主进程（首次运行前需要）
 npm run electron:dev
 ```
 
@@ -196,6 +203,9 @@ codepilot/
 ```bash
 # 仅运行 Next.js 开发服务器（在浏览器中打开）
 npm run dev
+
+# 编译 Electron 主进程（首次运行前需要执行）
+node scripts/build-electron.mjs
 
 # 运行完整的 Electron 桌面应用（开发模式）
 # （先启动 Next.js，等待就绪后打开 Electron）

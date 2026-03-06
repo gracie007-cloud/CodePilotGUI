@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo, memo } from 'react';
 import type { Message, TokenUsage, FileAttachment } from '@/types';
 import {
   Message as AIMessage,
@@ -8,8 +8,121 @@ import {
   MessageResponse,
 } from '@/components/ai-elements/message';
 import { ToolActionsGroup } from '@/components/ai-elements/tool-actions-group';
-import { CopyIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon } from 'lucide-react';
+import { HugeiconsIcon } from "@hugeicons/react";
+import { Copy01Icon, Tick01Icon, ArrowDown01Icon, ArrowUp01Icon } from "@hugeicons/core-free-icons";
 import { FileAttachmentDisplay } from './FileAttachmentDisplay';
+import { ImageGenConfirmation } from './ImageGenConfirmation';
+import { ImageGenCard } from './ImageGenCard';
+import { BatchPlanInlinePreview } from './batch-image-gen/BatchPlanInlinePreview';
+import { buildReferenceImages } from '@/lib/image-ref-store';
+import { parseDBDate } from '@/lib/utils';
+import type { PlannerOutput } from '@/types';
+
+interface ImageGenRequest {
+  prompt: string;
+  aspectRatio: string;
+  resolution: string;
+  referenceImages?: string[];
+  useLastGenerated?: boolean;
+}
+
+function parseImageGenRequest(text: string): { beforeText: string; request: ImageGenRequest; afterText: string } | null {
+  const regex = /```image-gen-request\s*\n?([\s\S]*?)\n?\s*```/;
+  const match = text.match(regex);
+  if (!match) return null;
+  try {
+    let raw = match[1].trim();
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      // Attempt to fix common model output issues: unescaped quotes in values
+      raw = raw.replace(/"prompt"\s*:\s*"([\s\S]*?)"\s*([,}])/g, (_m, val, tail) => {
+        const escaped = val.replace(/(?<!\\)"/g, '\\"');
+        return `"prompt": "${escaped}"${tail}`;
+      });
+      json = JSON.parse(raw);
+    }
+    const beforeText = text.slice(0, match.index).trim();
+    const afterText = text.slice((match.index || 0) + match[0].length).trim();
+    return {
+      beforeText,
+      request: {
+        prompt: String(json.prompt || ''),
+        aspectRatio: String(json.aspectRatio || '1:1'),
+        resolution: String(json.resolution || '1K'),
+        referenceImages: Array.isArray(json.referenceImages) ? json.referenceImages : undefined,
+        useLastGenerated: json.useLastGenerated === true,
+      },
+      afterText,
+    };
+  } catch {
+    return null;
+  }
+}
+
+interface ImageGenResultData {
+  status: 'generating' | 'completed' | 'error';
+  prompt: string;
+  aspectRatio?: string;
+  resolution?: string;
+  model?: string;
+  images?: Array<{ mimeType: string; localPath?: string; data?: string }>;
+  error?: string;
+}
+
+function parseImageGenResult(text: string): { beforeText: string; result: ImageGenResultData; afterText: string } | null {
+  const regex = /```image-gen-result\s*\n?([\s\S]*?)\n?\s*```/;
+  const match = text.match(regex);
+  if (!match) return null;
+  try {
+    const json = JSON.parse(match[1]);
+    const beforeText = text.slice(0, match.index).trim();
+    const afterText = text.slice((match.index || 0) + match[0].length).trim();
+    return {
+      beforeText,
+      result: {
+        status: json.status || 'completed',
+        prompt: String(json.prompt || ''),
+        aspectRatio: json.aspectRatio,
+        resolution: json.resolution,
+        model: json.model,
+        images: Array.isArray(json.images) ? json.images : undefined,
+        error: json.error,
+      },
+      afterText,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseBatchPlan(text: string): { beforeText: string; plan: PlannerOutput; afterText: string } | null {
+  const regex = /```batch-plan\s*\n?([\s\S]*?)\n?\s*```/;
+  const match = text.match(regex);
+  if (!match) return null;
+  try {
+    const json = JSON.parse(match[1]);
+    const beforeText = text.slice(0, match.index).trim();
+    const afterText = text.slice((match.index || 0) + match[0].length).trim();
+    return {
+      beforeText,
+      plan: {
+        summary: json.summary || '',
+        items: Array.isArray(json.items) ? json.items.map((item: Record<string, unknown>) => ({
+          prompt: String(item.prompt || ''),
+          aspectRatio: String(item.aspectRatio || '1:1'),
+          resolution: String(item.resolution || '1K'),
+          tags: Array.isArray(item.tags) ? item.tags : [],
+          sourceRefs: Array.isArray(item.sourceRefs) ? item.sourceRefs : [],
+        })) : [],
+      },
+      afterText,
+    };
+  } catch {
+    return null;
+  }
+}
 
 interface MessageItemProps {
   message: Message;
@@ -175,9 +288,9 @@ function CopyButton({ text }: { text: string }) {
       title="Copy"
     >
       {copied ? (
-        <CheckIcon className="h-3 w-3 text-green-500" />
+        <HugeiconsIcon icon={Tick01Icon} className="h-3 w-3 text-green-500" />
       ) : (
-        <CopyIcon className="h-3 w-3" />
+        <HugeiconsIcon icon={Copy01Icon} className="h-3 w-3" />
       )}
     </button>
   );
@@ -203,22 +316,34 @@ function TokenUsageDisplay({ usage }: { usage: TokenUsage }) {
 
 const COLLAPSE_HEIGHT = 300;
 
-export function MessageItem({ message }: MessageItemProps) {
+export const MessageItem = memo(function MessageItem({ message }: MessageItemProps) {
   const isUser = message.role === 'user';
-  const { text, tools } = parseToolBlocks(message.content);
-  const pairedTools = pairTools(tools);
 
-  // Parse file attachments from user messages
-  const { files, text: textWithoutFiles } = isUser
-    ? parseMessageFiles(text)
-    : { files: [], text };
-
-  const displayText = isUser ? textWithoutFiles : text;
-
-  // Collapse/expand state for long user messages
+  // Collapse/expand state for long user messages (hooks must be called unconditionally)
   const [isExpanded, setIsExpanded] = useState(false);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // Memoize expensive parsing: parseToolBlocks + pairTools
+  const { text, pairedTools } = useMemo(() => {
+    const { text, tools } = parseToolBlocks(message.content);
+    const pairedTools = pairTools(tools);
+    return { text, pairedTools };
+  }, [message.content]);
+
+  // Memoize file attachment parsing
+  const { files, displayText } = useMemo(() => {
+    if (isUser) {
+      const { files, text: textWithoutFiles } = parseMessageFiles(text);
+      return { files, displayText: textWithoutFiles };
+    }
+    return { files: [] as FileAttachment[], displayText: text };
+  }, [text, isUser]);
+
+  // Hide image-gen system notices — they exist in DB for Claude's context but shouldn't render
+  if (isUser && message.content.startsWith('[__IMAGE_GEN_NOTICE__')) {
+    return null;
+  }
 
   useEffect(() => {
     if (isUser && contentRef.current) {
@@ -226,16 +351,17 @@ export function MessageItem({ message }: MessageItemProps) {
     }
   }, [isUser, displayText]);
 
-  let tokenUsage: TokenUsage | null = null;
-  if (message.token_usage) {
+  // Memoize token usage JSON parsing
+  const tokenUsage = useMemo<TokenUsage | null>(() => {
+    if (!message.token_usage) return null;
     try {
-      tokenUsage = JSON.parse(message.token_usage);
+      return JSON.parse(message.token_usage);
     } catch {
-      // skip
+      return null;
     }
-  }
+  }, [message.token_usage]);
 
-  const timestamp = new Date(message.created_at).toLocaleTimeString([], {
+  const timestamp = parseDBDate(message.created_at).toLocaleTimeString([], {
     hour: '2-digit',
     minute: '2-digit',
   });
@@ -287,21 +413,19 @@ export function MessageItem({ message }: MessageItemProps) {
                 >
                   {isExpanded ? (
                     <>
-                      <ChevronUpIcon className="h-3 w-3" />
+                      <HugeiconsIcon icon={ArrowUp01Icon} className="h-3 w-3" />
                       <span>收起</span>
                     </>
                   ) : (
                     <>
-                      <ChevronDownIcon className="h-3 w-3" />
+                      <HugeiconsIcon icon={ArrowDown01Icon} className="h-3 w-3" />
                       <span>展开</span>
                     </>
                   )}
                 </button>
               )}
             </div>
-          ) : (
-            <MessageResponse>{displayText}</MessageResponse>
-          )
+          ) : <AssistantContent displayText={displayText} messageId={message.id} />
         )}
       </MessageContent>
 
@@ -313,4 +437,101 @@ export function MessageItem({ message }: MessageItemProps) {
       </div>
     </AIMessage>
   );
-}
+});
+
+/**
+ * Memoized assistant message content — avoids re-running parseBatchPlan / parseImageGenResult /
+ * parseImageGenRequest on every render when only unrelated props change.
+ */
+const AssistantContent = memo(function AssistantContent({ displayText, messageId }: { displayText: string; messageId: string }) {
+  return useMemo(() => {
+    // Try batch-plan first (Image Agent batch mode)
+    const batchPlanResult = parseBatchPlan(displayText);
+    if (batchPlanResult) {
+      return (
+        <>
+          {batchPlanResult.beforeText && <MessageResponse>{batchPlanResult.beforeText}</MessageResponse>}
+          <BatchPlanInlinePreview plan={batchPlanResult.plan} messageId={messageId} />
+          {batchPlanResult.afterText && <MessageResponse>{batchPlanResult.afterText}</MessageResponse>}
+        </>
+      );
+    }
+
+    // Try image-gen-result first (new direct-call format)
+    const genResult = parseImageGenResult(displayText);
+    if (genResult) {
+      const { result } = genResult;
+      if (result.status === 'generating') {
+        return (
+          <>
+            {genResult.beforeText && <MessageResponse>{genResult.beforeText}</MessageResponse>}
+            <div className="flex items-center gap-2 py-3">
+              <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+              <span className="text-sm text-muted-foreground">Generating image...</span>
+            </div>
+            {genResult.afterText && <MessageResponse>{genResult.afterText}</MessageResponse>}
+          </>
+        );
+      }
+      if (result.status === 'error') {
+        return (
+          <>
+            {genResult.beforeText && <MessageResponse>{genResult.beforeText}</MessageResponse>}
+            <div className="rounded-md border border-red-200 bg-red-50 dark:border-red-800 dark:bg-red-950/30 p-3">
+              <p className="text-sm text-red-600 dark:text-red-400">{result.error || 'Image generation failed'}</p>
+            </div>
+            {genResult.afterText && <MessageResponse>{genResult.afterText}</MessageResponse>}
+          </>
+        );
+      }
+      if (result.status === 'completed' && result.images && result.images.length > 0) {
+        return (
+          <>
+            {genResult.beforeText && <MessageResponse>{genResult.beforeText}</MessageResponse>}
+            <ImageGenCard
+              images={result.images.map(img => ({
+                data: img.data || '',
+                mimeType: img.mimeType,
+                localPath: img.localPath,
+              }))}
+              prompt={result.prompt}
+              aspectRatio={result.aspectRatio}
+              imageSize={result.resolution}
+              model={result.model}
+            />
+            {genResult.afterText && <MessageResponse>{genResult.afterText}</MessageResponse>}
+          </>
+        );
+      }
+    }
+
+    // Legacy: image-gen-request (model-dependent format, for old messages)
+    const parsed = parseImageGenRequest(displayText);
+    if (parsed) {
+      const refs = buildReferenceImages(
+        messageId,
+        parsed.request.useLastGenerated || false,
+        parsed.request.referenceImages,
+      );
+      return (
+        <>
+          {parsed.beforeText && <MessageResponse>{parsed.beforeText}</MessageResponse>}
+          <ImageGenConfirmation
+            messageId={messageId}
+            initialPrompt={parsed.request.prompt}
+            initialAspectRatio={parsed.request.aspectRatio}
+            initialResolution={parsed.request.resolution}
+            referenceImages={refs.length > 0 ? refs : undefined}
+          />
+          {parsed.afterText && <MessageResponse>{parsed.afterText}</MessageResponse>}
+        </>
+      );
+    }
+    const stripped = displayText
+      .replace(/```image-gen-request[\s\S]*?```/g, '')
+      .replace(/```image-gen-result[\s\S]*?```/g, '')
+      .replace(/```batch-plan[\s\S]*?```/g, '')
+      .trim();
+    return stripped ? <MessageResponse>{stripped}</MessageResponse> : null;
+  }, [displayText, messageId]);
+});

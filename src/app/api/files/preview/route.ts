@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readFilePreview, isPathSafe } from '@/lib/files';
+import path from 'path';
+import os from 'os';
+import { readFilePreview, isPathSafe, isRootPath } from '@/lib/files';
 import type { FilePreviewResponse, ErrorResponse } from '@/types';
 
 export async function GET(request: NextRequest) {
@@ -14,23 +16,18 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const path = require('path');
-  const os = require('os');
   const resolvedPath = path.resolve(filePath);
   const homeDir = os.homedir();
 
   // Validate that the file is within the session's working directory.
-  // The baseDir parameter should be the session's working directory,
-  // which acts as the trust boundary for file access.
-  // The baseDir itself must be under the user's home directory to prevent
-  // attackers from setting baseDir=/ to bypass all restrictions.
+  // baseDir may be on a different drive than homeDir on Windows.
+  // Only reject root paths as baseDir to prevent full-disk access.
   const baseDir = searchParams.get('baseDir');
   if (baseDir) {
     const resolvedBase = path.resolve(baseDir);
-    // Ensure baseDir is within the home directory (prevent baseDir=/ bypass)
-    if (!isPathSafe(homeDir, resolvedBase)) {
+    if (isRootPath(resolvedBase)) {
       return NextResponse.json<ErrorResponse>(
-        { error: 'Base directory is outside the allowed scope' },
+        { error: 'Cannot use filesystem root as base directory' },
         { status: 403 }
       );
     }
@@ -52,7 +49,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const preview = readFilePreview(resolvedPath, Math.min(maxLines, 1000));
+    const preview = await readFilePreview(resolvedPath, Math.min(maxLines, 1000));
     return NextResponse.json<FilePreviewResponse>({ preview });
   } catch (error) {
     return NextResponse.json<ErrorResponse>(

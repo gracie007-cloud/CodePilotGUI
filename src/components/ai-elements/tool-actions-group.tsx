@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { HugeiconsIcon } from "@hugeicons/react";
 import type { IconSvgElement } from "@hugeicons/react";
@@ -13,8 +13,8 @@ import {
   Loading02Icon,
   CheckmarkCircle02Icon,
   CancelCircleIcon,
+  ArrowRight01Icon,
 } from "@hugeicons/core-free-icons";
-import { ChevronRightIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
@@ -198,14 +198,11 @@ export function ToolActionsGroup({
 }: ToolActionsGroupProps) {
   const hasRunningTool = tools.some((t) => t.result === undefined);
 
-  const [userToggled, setUserToggled] = useState(false);
-  const [expanded, setExpanded] = useState(hasRunningTool);
+  // Track whether user has manually toggled and their chosen state
+  const [userExpandedState, setUserExpandedState] = useState<boolean | null>(null);
 
-  useEffect(() => {
-    if (!userToggled) {
-      setExpanded(hasRunningTool || isStreaming);
-    }
-  }, [hasRunningTool, isStreaming, userToggled]);
+  // Derived: if user has toggled, use their choice; otherwise auto-expand based on streaming state
+  const expanded = userExpandedState !== null ? userExpandedState : (hasRunningTool || isStreaming);
 
   if (tools.length === 0) return null;
 
@@ -214,14 +211,14 @@ export function ToolActionsGroup({
   const runningDesc = getRunningDescription(tools);
 
   const handleToggle = () => {
-    setUserToggled(true);
-    setExpanded((prev) => !prev);
+    setUserExpandedState((prev) => prev !== null ? !prev : !expanded);
   };
 
   // Build summary text parts
   const summaryParts: string[] = [];
   if (runningCount > 0) summaryParts.push(`${runningCount} running`);
   if (doneCount > 0) summaryParts.push(`${doneCount} completed`);
+  if (runningCount === 0 && isStreaming) summaryParts.push('generating response');
   if (summaryParts.length === 0) summaryParts.push(`${tools.length} actions`);
 
   return (
@@ -232,7 +229,8 @@ export function ToolActionsGroup({
         onClick={handleToggle}
         className="flex w-full items-center gap-2 py-1 text-xs rounded-sm hover:bg-muted/30 transition-colors"
       >
-        <ChevronRightIcon
+        <HugeiconsIcon
+          icon={ArrowRight01Icon}
           className={cn(
             "h-3 w-3 shrink-0 text-muted-foreground/60 transition-transform duration-200",
             expanded && "rotate-90"

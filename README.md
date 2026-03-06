@@ -1,13 +1,19 @@
 <img src="docs/icon-readme.png" width="32" height="32" alt="CodePilot" style="vertical-align: middle; margin-right: 8px;" /> CodePilot
 ===
 
-**A native desktop GUI for Claude Code** -- chat, code, and manage projects through a polished visual interface instead of the terminal.
+**A desktop GUI client for Claude Code** -- chat, code, and manage projects through a polished visual interface instead of the terminal.
 
 [![GitHub release](https://img.shields.io/github/v/release/op7418/CodePilot)](https://github.com/op7418/CodePilot/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/op7418/CodePilot/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [中文文档](./README_CN.md) | [日本語](./README_JA.md)
+
+### Join the Community / 加入用户群
+
+<img src="docs/wechat-group-qr.png" width="240" alt="WeChat Group QR Code" />
+
+Scan the QR code to join the WeChat user group for discussions, feedback, and updates.
 
 ---
 
@@ -28,7 +34,7 @@
 - **Auto update check** -- The app periodically checks for new releases and notifies you when an update is available.
 - **Dark / Light theme** -- One-click theme toggle in the navigation rail.
 - **Slash commands** -- Built-in commands like `/help`, `/clear`, `/cost`, `/compact`, `/doctor`, `/review`, and more.
-- **Electron packaging** -- Ships as a native desktop app with a hidden title bar, bundled Next.js server, graceful shutdown, and automatic port allocation.
+- **Electron packaging** -- Ships as a desktop app with a hidden title bar, bundled Next.js server, graceful shutdown, and automatic port allocation.
 
 ---
 
@@ -76,6 +82,7 @@ npm install
 npm run dev
 
 # -- or start the full Electron app in dev mode --
+node scripts/build-electron.mjs   # compile Electron main process (first time only)
 npm run electron:dev
 ```
 
@@ -196,6 +203,9 @@ codepilot/
 ```bash
 # Run Next.js dev server only (opens in browser)
 npm run dev
+
+# Compile the Electron main process (required before first run)
+node scripts/build-electron.mjs
 
 # Run the full Electron app in dev mode
 # (starts Next.js + waits for it, then opens Electron)

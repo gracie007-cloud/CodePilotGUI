@@ -15,14 +15,76 @@ import type {
   NotificationHookInput,
   PostToolUseHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { ClaudeStreamOptions, SSEEvent, TokenUsage, MCPServerConfig, PermissionRequestEvent, FileAttachment } from '@/types';
+import type { ClaudeStreamOptions, SSEEvent, TokenUsage, MCPServerConfig, PermissionRequestEvent, FileAttachment, ApiProvider } from '@/types';
 import { isImageFile } from '@/types';
 import { registerPendingPermission } from './permission-registry';
-import { getSetting, getActiveProvider } from './db';
+import { registerConversation, unregisterConversation } from './conversation-registry';
+import { getSetting, getActiveProvider, updateSdkSessionId, createPermissionRequest } from './db';
 import { findClaudeBinary, findGitBash, getExpandedPath } from './platform';
+import { notifyPermissionRequest, notifyGeneric } from './telegram-bot';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
+
+/**
+ * Sanitize a string for use as an environment variable value.
+ * Removes null bytes and control characters that cause spawn EINVAL.
+ */
+function sanitizeEnvValue(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+}
+
+/**
+ * Sanitize all values in an env record so child_process.spawn won't
+ * throw EINVAL due to invalid characters or non-string values.
+ * On Windows, spawn is strict: every env value MUST be a string.
+ * Spreading process.env can include undefined values which cause EINVAL.
+ */
+function sanitizeEnv(env: Record<string, string>): Record<string, string> {
+  const clean: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === 'string') {
+      clean[key] = sanitizeEnvValue(value);
+    }
+  }
+  return clean;
+}
+
+/**
+ * On Windows, npm installs CLI tools as .cmd wrappers that can't be
+ * spawned without shell:true. Parse the wrapper to extract the real
+ * .js script path so we can pass it to the SDK directly.
+ */
+function resolveScriptFromCmd(cmdPath: string): string | undefined {
+  try {
+    const content = fs.readFileSync(cmdPath, 'utf-8');
+    const cmdDir = path.dirname(cmdPath);
+
+    // npm .cmd wrappers typically contain a line like:
+    //   "%~dp0\node_modules\@anthropic-ai\claude-code\cli.js" %*
+    // Match paths containing claude-code or claude-agent and ending in .js
+    const patterns = [
+      // Quoted: "%~dp0\...\cli.js"
+      /"%~dp0\\([^"]*claude[^"]*\.js)"/i,
+      // Unquoted: %~dp0\...\cli.js
+      /%~dp0\\(\S*claude\S*\.js)/i,
+      // Quoted with %dp0%: "%dp0%\...\cli.js"
+      /"%dp0%\\([^"]*claude[^"]*\.js)"/i,
+    ];
+
+    for (const re of patterns) {
+      const m = content.match(re);
+      if (m) {
+        const resolved = path.normalize(path.join(cmdDir, m[1]));
+        if (fs.existsSync(resolved)) return resolved;
+      }
+    }
+  } catch {
+    // ignore read errors
+  }
+  return undefined;
+}
 
 let cachedClaudePath: string | null | undefined;
 
@@ -135,31 +197,78 @@ function extractTokenUsage(msg: SDKResultMessage): TokenUsage | null {
  * Returns a ReadableStream of SSE-formatted strings.
  */
 /**
- * Save non-image file attachments to a temporary upload directory
- * and return the file paths. The files are placed in .codepilot-uploads/
- * under the working directory so Claude's Read tool can access them.
+ * Get file paths for non-image attachments. If the file already has a
+ * persisted filePath (written by the uploads route), reuse it. Otherwise
+ * fall back to writing the file to .codepilot-uploads/.
  */
-function saveUploadedFiles(files: FileAttachment[], workDir: string): string[] {
-  const uploadDir = path.join(workDir, '.codepilot-uploads');
-  if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-  }
-  const savedPaths: string[] = [];
+function getUploadedFilePaths(files: FileAttachment[], workDir: string): string[] {
+  const paths: string[] = [];
+  let uploadDir: string | undefined;
   for (const file of files) {
-    // Sanitize filename to prevent directory traversal
-    const safeName = path.basename(file.name).replace(/[^a-zA-Z0-9._-]/g, '_');
-    const timestamp = Date.now();
-    const filePath = path.join(uploadDir, `${timestamp}-${safeName}`);
-    const buffer = Buffer.from(file.data, 'base64');
-    fs.writeFileSync(filePath, buffer);
-    savedPaths.push(filePath);
+    if (file.filePath) {
+      paths.push(file.filePath);
+    } else {
+      // Fallback: write file to disk (should not happen in normal flow)
+      if (!uploadDir) {
+        uploadDir = path.join(workDir, '.codepilot-uploads');
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+      }
+      const safeName = path.basename(file.name).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filePath = path.join(uploadDir, `${Date.now()}-${safeName}`);
+      const buffer = Buffer.from(file.data, 'base64');
+      fs.writeFileSync(filePath, buffer);
+      paths.push(filePath);
+    }
   }
-  return savedPaths;
+  return paths;
+}
+
+/**
+ * Build a context-enriched prompt by prepending conversation history.
+ * Used when SDK session resume is unavailable or fails.
+ */
+function buildPromptWithHistory(
+  prompt: string,
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>,
+): string {
+  if (!history || history.length === 0) return prompt;
+
+  const lines: string[] = ['<conversation_history>'];
+  for (const msg of history) {
+    // For assistant messages with tool blocks (JSON arrays), summarize
+    let content = msg.content;
+    if (msg.role === 'assistant' && content.startsWith('[')) {
+      try {
+        const blocks = JSON.parse(content);
+        const parts: string[] = [];
+        for (const b of blocks) {
+          if (b.type === 'text' && b.text) parts.push(b.text);
+          else if (b.type === 'tool_use') parts.push(`[Used tool: ${b.name}]`);
+          else if (b.type === 'tool_result') {
+            const resultStr = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+            // Truncate long tool results
+            parts.push(`[Tool result: ${resultStr.slice(0, 500)}${resultStr.length > 500 ? '...' : ''}]`);
+          }
+        }
+        content = parts.join('\n');
+      } catch {
+        // Not JSON, use as-is
+      }
+    }
+    lines.push(`${msg.role === 'user' ? 'Human' : 'Assistant'}: ${content}`);
+  }
+  lines.push('</conversation_history>');
+  lines.push('');
+  lines.push(prompt);
+  return lines.join('\n');
 }
 
 export function streamClaude(options: ClaudeStreamOptions): ReadableStream<string> {
   const {
     prompt,
+    sessionId,
     sdkSessionId,
     model,
     systemPrompt,
@@ -168,10 +277,17 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
     abortController,
     permissionMode,
     files,
+    toolTimeoutSeconds = 0,
+    conversationHistory,
+    onRuntimeStatusChange,
+    imageAgentMode,
   } = options;
 
   return new ReadableStream<string>({
     async start(controller) {
+      // Hoist activeProvider so it's accessible in the catch block for error messages
+      const activeProvider: ApiProvider | undefined = options.provider ?? getActiveProvider();
+
       try {
         // Build env for the Claude Code subprocess.
         // Start with process.env (includes user shell env from Electron's loadUserShellEnv).
@@ -184,6 +300,12 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
         // Ensure SDK subprocess has expanded PATH (consistent with Electron mode)
         sdkEnv.PATH = getExpandedPath();
 
+        // Remove CLAUDECODE env var to prevent "nested session" detection.
+        // When CodePilot is launched from within a Claude Code CLI session
+        // (e.g. during development), the child process inherits this variable
+        // and the SDK refuses to start.
+        delete sdkEnv.CLAUDECODE;
+
         // On Windows, auto-detect Git Bash if not already configured
         if (process.platform === 'win32' && !process.env.CLAUDE_CODE_GIT_BASH_PATH) {
           const gitBashPath = findGitBash();
@@ -191,9 +313,6 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
             sdkEnv.CLAUDE_CODE_GIT_BASH_PATH = gitBashPath;
           }
         }
-
-        // Try to get config from active provider first
-        const activeProvider = getActiveProvider();
 
         if (activeProvider && activeProvider.api_key) {
           // Clear all existing ANTHROPIC_* variables to prevent conflicts
@@ -249,23 +368,44 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
         const skipPermissions = getSetting('dangerously_skip_permissions') === 'true';
 
         const queryOptions: Options = {
-          cwd: workingDirectory || process.cwd(),
+          cwd: workingDirectory || os.homedir(),
           abortController,
           includePartialMessages: true,
           permissionMode: skipPermissions
             ? 'bypassPermissions'
             : ((permissionMode as Options['permissionMode']) || 'acceptEdits'),
-          env: sdkEnv,
+          env: sanitizeEnv(sdkEnv),
+          // Load settings so the SDK behaves like the CLI (tool permissions,
+          // CLAUDE.md, etc.). When an active provider is configured in
+          // CodePilot, skip 'user' settings because ~/.claude/settings.json
+          // may contain env overrides (ANTHROPIC_BASE_URL, ANTHROPIC_MODEL,
+          // etc.) that would conflict with the provider's configuration.
+          settingSources: activeProvider?.api_key
+            ? ['project', 'local']
+            : ['user', 'project', 'local'],
         };
 
         if (skipPermissions) {
           queryOptions.allowDangerouslySkipPermissions = true;
         }
 
-        // Find claude binary for packaged app where PATH is limited
+        // Find claude binary for packaged app where PATH is limited.
+        // On Windows, npm installs Claude CLI as a .cmd wrapper which cannot
+        // be spawned directly without shell:true. Parse the wrapper to
+        // extract the real .js script path and pass that to the SDK instead.
         const claudePath = findClaudePath();
         if (claudePath) {
-          queryOptions.pathToClaudeCodeExecutable = claudePath;
+          const ext = path.extname(claudePath).toLowerCase();
+          if (ext === '.cmd' || ext === '.bat') {
+            const scriptPath = resolveScriptFromCmd(claudePath);
+            if (scriptPath) {
+              queryOptions.pathToClaudeCodeExecutable = scriptPath;
+            } else {
+              console.warn('[claude-client] Could not resolve .js path from .cmd wrapper, falling back to SDK resolution:', claudePath);
+            }
+          } else {
+            queryOptions.pathToClaudeCodeExecutable = claudePath;
+          }
         }
 
         if (model) {
@@ -282,12 +422,34 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           };
         }
 
+        // MCP servers: only pass explicitly provided config (e.g. from CodePilot UI).
+        // User-level MCP config from ~/.claude.json and ~/.claude/settings.json
+        // is now automatically loaded by the SDK via settingSources: ['user', 'project', 'local'].
         if (mcpServers && Object.keys(mcpServers).length > 0) {
           queryOptions.mcpServers = toSdkMcpConfig(mcpServers);
         }
 
-        // Resume session if we have an SDK session ID from a previous conversation turn
-        if (sdkSessionId) {
+        // Resume session if we have an SDK session ID from a previous conversation turn.
+        // Pre-check: verify working_directory exists before attempting resume.
+        // Resume depends on session context (cwd/project scope), so if the
+        // original working_directory no longer exists, resume will fail.
+        let shouldResume = !!sdkSessionId;
+        if (shouldResume && workingDirectory && !fs.existsSync(workingDirectory)) {
+          console.warn(`[claude-client] Working directory "${workingDirectory}" does not exist, skipping resume`);
+          shouldResume = false;
+          if (sessionId) {
+            try { updateSdkSessionId(sessionId, ''); } catch { /* best effort */ }
+          }
+          controller.enqueue(formatSSE({
+            type: 'status',
+            data: JSON.stringify({
+              notification: true,
+              title: 'Session fallback',
+              message: 'Original working directory no longer exists. Starting fresh conversation.',
+            }),
+          }));
+        }
+        if (shouldResume) {
           queryOptions.resume = sdkSessionId;
         }
 
@@ -306,15 +468,49 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
             description: undefined,
           };
 
+          // Persist permission request to DB for audit/recovery
+          const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString().replace('T', ' ').split('.')[0];
+          try {
+            createPermissionRequest({
+              id: permissionRequestId,
+              sessionId,
+              sdkSessionId: sdkSessionId || '',
+              toolName,
+              toolInput: JSON.stringify(input),
+              decisionReason: opts.decisionReason || '',
+              expiresAt,
+            });
+          } catch (e) {
+            console.warn('[claude-client] Failed to persist permission request to DB:', e);
+          }
+
           // Send permission_request SSE event to the client
           controller.enqueue(formatSSE({
             type: 'permission_request',
             data: JSON.stringify(permEvent),
           }));
 
+          // Notify via Telegram (fire-and-forget)
+          notifyPermissionRequest(toolName, input as Record<string, unknown>, telegramOpts).catch(() => {});
+
+          // Notify runtime status change
+          onRuntimeStatusChange?.('waiting_permission');
+
           // Wait for user response (resolved by POST /api/chat/permission)
           // Store original input so registry can inject updatedInput on allow
-          return registerPendingPermission(permissionRequestId, input, opts.signal);
+          const result = await registerPendingPermission(permissionRequestId, input, opts.signal);
+
+          // Restore runtime status after permission resolved
+          onRuntimeStatusChange?.('running');
+
+          return result;
+        };
+
+        // Telegram notification context for hooks
+        const telegramOpts = {
+          sessionId,
+          sessionTitle: undefined as string | undefined,
+          workingDirectory,
         };
 
         // Hooks: capture notifications and tool completion events
@@ -330,12 +526,15 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                   message: notif.message,
                 }),
               }));
+              // Forward to Telegram (fire-and-forget)
+              notifyGeneric(notif.title || '', notif.message || '', telegramOpts).catch(() => {});
               return {};
             }],
           }],
           PostToolUse: [{
             hooks: [async (input) => {
               const toolEvent = input as PostToolUseHookInput;
+              console.log('[claude-client] PostToolUse:', toolEvent.tool_name, 'id:', toolEvent.tool_use_id);
               controller.enqueue(formatSSE({
                 type: 'tool_result',
                 data: JSON.stringify({
@@ -346,6 +545,34 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                   is_error: false,
                 }),
               }));
+
+              // Detect TodoWrite tool and emit task_update SSE for frontend sync
+              if (toolEvent.tool_name === 'TodoWrite') {
+                try {
+                  // SDK TodoWriteInput: { todos: { content, status, activeForm }[] }
+                  const toolInput = toolEvent.tool_input as {
+                    todos?: Array<{ content: string; status: string; activeForm?: string }>;
+                  };
+                  if (toolInput?.todos && Array.isArray(toolInput.todos)) {
+                    console.log('[claude-client] TodoWrite detected, syncing', toolInput.todos.length, 'tasks');
+                    controller.enqueue(formatSSE({
+                      type: 'task_update',
+                      data: JSON.stringify({
+                        session_id: sessionId,
+                        todos: toolInput.todos.map((t, i) => ({
+                          id: String(i),
+                          content: t.content,
+                          status: t.status,
+                          activeForm: t.activeForm || '',
+                        })),
+                      }),
+                    }));
+                  }
+                } catch (e) {
+                  console.warn('[claude-client] Failed to parse TodoWrite input:', e);
+                }
+              }
+
               return {};
             }],
           }],
@@ -375,28 +602,46 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           }
         };
 
-        // Build the prompt with file attachments.
-        // Images → sent as multimodal base64 content blocks (vision).
-        // Non-image files → saved to disk and referenced via Read tool.
-        let finalPrompt: string | AsyncIterable<SDKUserMessage> = prompt;
+        // Build the prompt with file attachments and optional conversation history.
+        // When resuming, the SDK has full context so we send the raw prompt.
+        // When NOT resuming (fresh or fallback), prepend DB history for context.
+        function buildFinalPrompt(useHistory: boolean): string | AsyncIterable<SDKUserMessage> {
+          const basePrompt = useHistory
+            ? buildPromptWithHistory(prompt, conversationHistory)
+            : prompt;
 
-        if (files && files.length > 0) {
+          if (!files || files.length === 0) return basePrompt;
+
           const imageFiles = files.filter(f => isImageFile(f.type));
           const nonImageFiles = files.filter(f => !isImageFile(f.type));
 
-          // Save non-image files to disk for Read tool access
-          let textPrompt = prompt;
+          let textPrompt = basePrompt;
           if (nonImageFiles.length > 0) {
-            const workDir = workingDirectory || process.cwd();
-            const savedPaths = saveUploadedFiles(nonImageFiles, workDir);
+            const workDir = workingDirectory || os.homedir();
+            const savedPaths = getUploadedFilePaths(nonImageFiles, workDir);
             const fileReferences = savedPaths
               .map((p, i) => `[User attached file: ${p} (${nonImageFiles[i].name})]`)
               .join('\n');
-            textPrompt = `${fileReferences}\n\nPlease read the attached file(s) above using your Read tool, then respond to the user's message:\n\n${prompt}`;
+            textPrompt = `${fileReferences}\n\nPlease read the attached file(s) above using your Read tool, then respond to the user's message:\n\n${basePrompt}`;
           }
 
-          // If there are images, build a multimodal SDKUserMessage
           if (imageFiles.length > 0) {
+            // In imageAgentMode, skip file path references so Claude doesn't
+            // try to use built-in tools to analyze images from disk. It will
+            // see the images via vision (base64 content blocks) and follow the
+            // IMAGE_AGENT_SYSTEM_PROMPT to output image-gen-request blocks.
+            // In normal mode, append disk paths so skills can reference them.
+            const textWithImageRefs = imageAgentMode
+              ? textPrompt
+              : (() => {
+                  const workDir = workingDirectory || os.homedir();
+                  const imagePaths = getUploadedFilePaths(imageFiles, workDir);
+                  const imageReferences = imagePaths
+                    .map((p, i) => `[User attached image: ${p} (${imageFiles[i].name})]`)
+                    .join('\n');
+                  return `${imageReferences}\n\n${textPrompt}`;
+                })();
+
             const contentBlocks: Array<
               | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
               | { type: 'text'; text: string }
@@ -413,7 +658,7 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
               });
             }
 
-            contentBlocks.push({ type: 'text', text: textPrompt });
+            contentBlocks.push({ type: 'text', text: textWithImageRefs });
 
             const userMessage: SDKUserMessage = {
               type: 'user',
@@ -425,19 +670,66 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
               session_id: sdkSessionId || '',
             };
 
-            // Create a single-message async iterable
-            finalPrompt = (async function* () {
+            return (async function* () {
               yield userMessage;
             })();
-          } else {
-            finalPrompt = textPrompt;
           }
+
+          return textPrompt;
         }
 
-        const conversation = query({
+        const finalPrompt = buildFinalPrompt(!shouldResume);
+
+        // Try to start the conversation. If resuming a previous session fails
+        // (e.g. stale/corrupt session file, CLI version mismatch), automatically
+        // fall back to starting a fresh conversation without resume.
+        let conversation = query({
           prompt: finalPrompt,
           options: queryOptions,
         });
+
+        // Wrap the iterator so we can detect resume failures on the first message
+        if (shouldResume) {
+          try {
+            // Peek at the first message to verify resume works
+            const iter = conversation[Symbol.asyncIterator]();
+            const first = await iter.next();
+
+            // Re-wrap into an async iterable that yields the first message then the rest
+            conversation = (async function* () {
+              if (!first.done) yield first.value;
+              while (true) {
+                const next = await iter.next();
+                if (next.done) break;
+                yield next.value;
+              }
+            })() as ReturnType<typeof query>;
+          } catch (resumeError) {
+            const errMsg = resumeError instanceof Error ? resumeError.message : String(resumeError);
+            console.warn('[claude-client] Resume failed, retrying without resume:', errMsg);
+            // Clear stale sdk_session_id so future messages don't retry this broken resume
+            if (sessionId) {
+              try { updateSdkSessionId(sessionId, ''); } catch { /* best effort */ }
+            }
+            // Notify frontend about the fallback
+            controller.enqueue(formatSSE({
+              type: 'status',
+              data: JSON.stringify({
+                notification: true,
+                title: 'Session fallback',
+                message: 'Previous session could not be resumed. Starting fresh conversation.',
+              }),
+            }));
+            // Remove resume and try again as a fresh conversation with history context
+            delete queryOptions.resume;
+            conversation = query({
+              prompt: buildFinalPrompt(true),
+              options: queryOptions,
+            });
+          }
+        }
+
+        registerConversation(sessionId, conversation);
 
         let lastAssistantText = '';
         let tokenUsage: TokenUsage | null = null;
@@ -526,6 +818,15 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                       tools: sysMsg.tools,
                     }),
                   }));
+                } else if (sysMsg.subtype === 'status') {
+                  // SDK sends status messages when permission mode changes (e.g. ExitPlanMode)
+                  const statusMsg = sysMsg as SDKSystemMessage & { permissionMode?: string };
+                  if (statusMsg.permissionMode) {
+                    controller.enqueue(formatSSE({
+                      type: 'mode_changed',
+                      data: statusMsg.permissionMode,
+                    }));
+                  }
                 }
               }
               break;
@@ -542,6 +843,17 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                   elapsed_time_seconds: progressMsg.elapsed_time_seconds,
                 }),
               }));
+              // Auto-timeout: abort if tool runs longer than configured threshold
+              if (toolTimeoutSeconds > 0 && progressMsg.elapsed_time_seconds >= toolTimeoutSeconds) {
+                controller.enqueue(formatSSE({
+                  type: 'tool_timeout',
+                  data: JSON.stringify({
+                    tool_name: progressMsg.tool_name,
+                    elapsed_seconds: Math.round(progressMsg.elapsed_time_seconds),
+                  }),
+                }));
+                abortController?.abort();
+              }
               break;
             }
 
@@ -561,16 +873,79 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
               }));
               break;
             }
+
+            default: {
+              if ((message as { type: string }).type === 'keep_alive') {
+                controller.enqueue(formatSSE({ type: 'keep_alive', data: '' }));
+              }
+              break;
+            }
           }
         }
 
         controller.enqueue(formatSSE({ type: 'done', data: '' }));
         controller.close();
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const rawMessage = error instanceof Error ? error.message : 'Unknown error';
+        // Log full error details for debugging (visible in terminal / dev tools)
+        console.error('[claude-client] Stream error:', {
+          message: rawMessage,
+          stack: error instanceof Error ? error.stack : undefined,
+          cause: error instanceof Error ? (error as { cause?: unknown }).cause : undefined,
+          stderr: error instanceof Error ? (error as { stderr?: string }).stderr : undefined,
+          code: error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined,
+        });
+
+        // Try to extract stderr or cause for more useful error messages
+        const stderr = error instanceof Error ? (error as { stderr?: string }).stderr : undefined;
+        const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+        const extraDetail = stderr || (cause instanceof Error ? cause.message : cause ? String(cause) : '');
+
+        let errorMessage = rawMessage;
+
+        // Provide more specific error messages based on error type
+        if (error instanceof Error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === 'ENOENT' || rawMessage.includes('ENOENT') || rawMessage.includes('spawn')) {
+            errorMessage = `Claude Code CLI not found. Please ensure Claude Code is installed and available in your PATH.\n\nOriginal error: ${rawMessage}`;
+          } else if (rawMessage.includes('exited with code 1') || rawMessage.includes('exit code 1')) {
+            const providerHint = activeProvider?.name ? ` (Provider: ${activeProvider.name})` : '';
+            const detailHint = extraDetail ? `\n\nDetails: ${extraDetail}` : '';
+            errorMessage = `Claude Code process exited with an error${providerHint}. This is often caused by:\n• Invalid or missing API Key\n• Incorrect Base URL configuration\n• Network connectivity issues${detailHint}\n\nOriginal error: ${rawMessage}`;
+          } else if (rawMessage.includes('exited with code')) {
+            const providerHint = activeProvider?.name ? ` (Provider: ${activeProvider.name})` : '';
+            errorMessage = `Claude Code process crashed unexpectedly${providerHint}.\n\nOriginal error: ${rawMessage}`;
+          } else if (code === 'ECONNREFUSED' || rawMessage.includes('ECONNREFUSED') || rawMessage.includes('fetch failed')) {
+            const baseUrl = activeProvider?.base_url || 'default';
+            errorMessage = `Cannot connect to API endpoint (${baseUrl}). Please check your network connection and Base URL configuration.\n\nOriginal error: ${rawMessage}`;
+          } else if (rawMessage.includes('401') || rawMessage.includes('Unauthorized') || rawMessage.includes('authentication')) {
+            const providerHint = activeProvider?.name ? ` for provider "${activeProvider.name}"` : '';
+            errorMessage = `Authentication failed${providerHint}. Please verify your API Key is correct and has not expired.\n\nOriginal error: ${rawMessage}`;
+          } else if (rawMessage.includes('403') || rawMessage.includes('Forbidden')) {
+            errorMessage = `Access denied. Your API Key may not have permission for this operation.\n\nOriginal error: ${rawMessage}`;
+          } else if (rawMessage.includes('429') || rawMessage.includes('rate limit') || rawMessage.includes('Rate limit')) {
+            errorMessage = `Rate limit exceeded. Please wait a moment before retrying.\n\nOriginal error: ${rawMessage}`;
+          }
+        }
+
         controller.enqueue(formatSSE({ type: 'error', data: errorMessage }));
         controller.enqueue(formatSSE({ type: 'done', data: '' }));
+
+        // If we were resuming a session and it crashed mid-stream, clear the
+        // stale sdk_session_id so the next message starts a fresh SDK session
+        // instead of repeatedly hitting the same broken resume.
+        if (sdkSessionId && sessionId) {
+          try {
+            updateSdkSessionId(sessionId, '');
+            console.warn('[claude-client] Cleared stale sdk_session_id for session', sessionId);
+          } catch {
+            // best effort
+          }
+        }
+
         controller.close();
+      } finally {
+        unregisterConversation(sessionId);
       }
     },
 

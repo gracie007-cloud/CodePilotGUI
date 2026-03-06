@@ -4,14 +4,11 @@ import { useRef, useState, useCallback, useEffect, type KeyboardEvent, type Form
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
   AtIcon,
-  FolderOpenIcon,
-  Wrench01Icon,
-  ClipboardIcon,
   HelpCircleIcon,
   ArrowDown01Icon,
   ArrowUp02Icon,
   CommandLineIcon,
-  Attachment01Icon,
+  PlusSignIcon,
   Cancel01Icon,
   Delete02Icon,
   Coins01Icon,
@@ -21,9 +18,11 @@ import {
   SearchList01Icon,
   BrainIcon,
   GlobalIcon,
+  StopIcon,
 } from "@hugeicons/core-free-icons";
 import { cn } from '@/lib/utils';
-import { FolderPicker } from './FolderPicker';
+import { useTranslation } from '@/hooks/useTranslation';
+import type { TranslationKey } from '@/i18n';
 import {
   PromptInput,
   PromptInputTextarea,
@@ -33,26 +32,59 @@ import {
   PromptInputSubmit,
   usePromptInputAttachments,
 } from '@/components/ai-elements/prompt-input';
-import { SquareIcon } from 'lucide-react';
 import type { ChatStatus } from 'ai';
-import type { FileAttachment } from '@/types';
+import type { FileAttachment, ProviderModelGroup } from '@/types';
 import { nanoid } from 'nanoid';
+import { ImageGenToggle } from './ImageGenToggle';
+import { useImageGen } from '@/hooks/useImageGen';
+import { PENDING_KEY, setRefImages, deleteRefImages } from '@/lib/image-ref-store';
 
-// Accepted file types for upload
-const ACCEPTED_FILE_TYPES = [
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-  'application/pdf',
-  'text/*',
-  '.md', '.json', '.csv', '.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs',
-].join(',');
+const IMAGE_AGENT_SYSTEM_PROMPT = `你是一个图像生成助手。当用户请求生成图片时，分析用户意图并以结构化格式输出。
 
-// Max file sizes
-const MAX_IMAGE_SIZE = 5 * 1024 * 1024;  // 5MB
-const MAX_DOC_SIZE = 10 * 1024 * 1024;   // 10MB
-const MAX_FILE_SIZE = MAX_DOC_SIZE;       // Use larger limit; we validate per-type in conversion
+## 单张生成
+如果用户只需要生成一张图片，输出：
+\`\`\`image-gen-request
+{"prompt":"详细的英文描述","aspectRatio":"1:1","resolution":"1K"}
+\`\`\`
+
+## 批量生成
+如果用户提供了文档/列表/多个需求，需要批量生成多张图片，输出：
+\`\`\`batch-plan
+{"summary":"计划摘要","items":[{"prompt":"英文描述","aspectRatio":"1:1","resolution":"1K","tags":[]}]}
+\`\`\`
+
+## 参考图（垫图）
+如果用户上传了图片，这些图片会自动作为参考图传给图片生成模型。你在 prompt 中应该描述如何利用这些参考图，例如：
+- 基于参考图的风格/内容进行创作
+- 将参考图中的元素融入新图
+- 按照参考图的构图生成新图
+
+## 连续编辑（基于上一次生成结果）
+如果用户要求修改/编辑/调整之前生成的图片，在 JSON 中加入 "useLastGenerated": true，系统会自动将上次生成的结果图作为参考图传入。
+编辑模式下 prompt 要简洁直接，只描述要做的修改，不要重复描述整张图片的内容。例如：
+- 用户说"去掉右边的香水" → prompt: "Remove the perfume bottle on the right side of the image"
+- 用户说"把背景换成蓝色" → prompt: "Change the background color to blue"
+- 用户说"加个太阳" → prompt: "Add a sun in the sky"
+
+\`\`\`image-gen-request
+{"prompt":"简洁的英文编辑指令","aspectRatio":"1:1","resolution":"1K","useLastGenerated":true}
+\`\`\`
+
+## 规则
+- 新图生成时 prompt 必须是详细的英文描述
+- 编辑已有图片时 prompt 应该简洁直接，只描述修改内容
+- aspectRatio 可选: 1:1, 16:9, 9:16, 3:2, 2:3, 4:3, 3:4
+- resolution 可选: 1K, 2K, 4K
+- 批量生成时每个 item 都需要独立的详细 prompt
+- 如果用户没有特别要求比例和分辨率，使用 1:1 和 1K 作为默认值
+- 如果用户上传了参考图，prompt 中要明确说明如何使用这些参考图
+- 如果用户要求修改上一张生成的图片，必须加 "useLastGenerated": true
+- 在输出结构化块之前，可以先简要说明你的理解和计划`;
+
 
 interface MessageInputProps {
-  onSend: (content: string, files?: FileAttachment[]) => void;
+  onSend: (content: string, files?: FileAttachment[], systemPromptAppend?: string, displayOverride?: string) => void;
+  onImageGenerate?: (prompt: string, files?: FileAttachment[]) => void;
   onCommand?: (command: string) => void;
   onStop?: () => void;
   disabled?: boolean;
@@ -60,8 +92,9 @@ interface MessageInputProps {
   sessionId?: string;
   modelName?: string;
   onModelChange?: (model: string) => void;
+  providerId?: string;
+  onProviderModelChange?: (providerId: string, model: string) => void;
   workingDirectory?: string;
-  onWorkingDirectoryChange?: (dir: string) => void;
   mode?: string;
   onModeChange?: (mode: string) => void;
 }
@@ -70,9 +103,11 @@ interface PopoverItem {
   label: string;
   value: string;
   description?: string;
+  descriptionKey?: TranslationKey;
   builtIn?: boolean;
   immediate?: boolean;
   installedSource?: "agents" | "claude";
+  source?: "global" | "project" | "plugin" | "installed";
   icon?: typeof CommandLineIcon;
 }
 
@@ -95,85 +130,33 @@ const COMMAND_PROMPTS: Record<string, string> = {
 };
 
 const BUILT_IN_COMMANDS: PopoverItem[] = [
-  { label: 'help', value: '/help', description: 'Show available commands and tips', builtIn: true, immediate: true, icon: HelpCircleIcon },
-  { label: 'clear', value: '/clear', description: 'Clear conversation history', builtIn: true, immediate: true, icon: Delete02Icon },
-  { label: 'cost', value: '/cost', description: 'Show token usage statistics', builtIn: true, immediate: true, icon: Coins01Icon },
-  { label: 'compact', value: '/compact', description: 'Compress conversation context', builtIn: true, icon: FileZipIcon },
-  { label: 'doctor', value: '/doctor', description: 'Diagnose project health', builtIn: true, icon: Stethoscope02Icon },
-  { label: 'init', value: '/init', description: 'Initialize CLAUDE.md for project', builtIn: true, icon: FileEditIcon },
-  { label: 'review', value: '/review', description: 'Review code quality', builtIn: true, icon: SearchList01Icon },
-  { label: 'terminal-setup', value: '/terminal-setup', description: 'Configure terminal settings', builtIn: true, icon: CommandLineIcon },
-  { label: 'memory', value: '/memory', description: 'Edit project memory file', builtIn: true, icon: BrainIcon },
+  { label: 'help', value: '/help', description: 'Show available commands and tips', descriptionKey: 'messageInput.helpDesc', builtIn: true, immediate: true, icon: HelpCircleIcon },
+  { label: 'clear', value: '/clear', description: 'Clear conversation history', descriptionKey: 'messageInput.clearDesc', builtIn: true, immediate: true, icon: Delete02Icon },
+  { label: 'cost', value: '/cost', description: 'Show token usage statistics', descriptionKey: 'messageInput.costDesc', builtIn: true, immediate: true, icon: Coins01Icon },
+  { label: 'compact', value: '/compact', description: 'Compress conversation context', descriptionKey: 'messageInput.compactDesc', builtIn: true, icon: FileZipIcon },
+  { label: 'doctor', value: '/doctor', description: 'Diagnose project health', descriptionKey: 'messageInput.doctorDesc', builtIn: true, icon: Stethoscope02Icon },
+  { label: 'init', value: '/init', description: 'Initialize CLAUDE.md for project', descriptionKey: 'messageInput.initDesc', builtIn: true, icon: FileEditIcon },
+  { label: 'review', value: '/review', description: 'Review code quality', descriptionKey: 'messageInput.reviewDesc', builtIn: true, icon: SearchList01Icon },
+  { label: 'terminal-setup', value: '/terminal-setup', description: 'Configure terminal settings', descriptionKey: 'messageInput.terminalSetupDesc', builtIn: true, icon: CommandLineIcon },
+  { label: 'memory', value: '/memory', description: 'Edit project memory file', descriptionKey: 'messageInput.memoryDesc', builtIn: true, icon: BrainIcon },
 ];
 
 interface ModeOption {
   value: string;
   label: string;
-  icon: typeof Wrench01Icon;
-  description: string;
 }
 
 const MODE_OPTIONS: ModeOption[] = [
-  { value: 'code', label: 'Code', icon: Wrench01Icon, description: 'Read, write files & run commands' },
-  { value: 'plan', label: 'Plan', icon: ClipboardIcon, description: 'Analyze & plan without executing' },
-  { value: 'ask', label: 'Ask', icon: HelpCircleIcon, description: 'Answer questions only' },
+  { value: 'code', label: 'Code' },
+  { value: 'plan', label: 'Plan' },
 ];
 
-// Default Claude model options — labels are dynamically overridden by active provider
+// Default Claude model options — used as fallback when API is unavailable
 const DEFAULT_MODEL_OPTIONS = [
-  { value: 'sonnet', label: 'Sonnet 4.5' },
+  { value: 'sonnet', label: 'Sonnet 4.6' },
   { value: 'opus', label: 'Opus 4.6' },
   { value: 'haiku', label: 'Haiku 4.5' },
 ];
-
-// Provider-specific model label mappings (alias → display name)
-const PROVIDER_MODEL_LABELS: Record<string, Record<string, string>> = {
-  // GLM Coding Plan (Z.AI / 智谱)
-  'https://api.z.ai/api/anthropic': {
-    sonnet: 'GLM-4.7',
-    opus: 'GLM-4.7',
-    haiku: 'GLM-4.5-Air',
-  },
-  'https://open.bigmodel.cn/api/anthropic': {
-    sonnet: 'GLM-4.7',
-    opus: 'GLM-4.7',
-    haiku: 'GLM-4.5-Air',
-  },
-  // Kimi Coding Plan
-  'https://api.kimi.com/coding/': {
-    sonnet: 'Kimi K2.5',
-    opus: 'Kimi K2.5',
-    haiku: 'Kimi K2.5',
-  },
-  // Moonshot Open Platform
-  'https://api.moonshot.ai/anthropic': {
-    sonnet: 'Kimi K2.5',
-    opus: 'Kimi K2.5',
-    haiku: 'Kimi K2.5',
-  },
-  'https://api.moonshot.cn/anthropic': {
-    sonnet: 'Kimi K2.5',
-    opus: 'Kimi K2.5',
-    haiku: 'Kimi K2.5',
-  },
-  // MiniMax Coding Plan
-  'https://api.minimaxi.com/anthropic': {
-    sonnet: 'MiniMax-M2.1',
-    opus: 'MiniMax-M2.1',
-    haiku: 'MiniMax-M2.1',
-  },
-  'https://api.minimax.io/anthropic': {
-    sonnet: 'MiniMax-M2.1',
-    opus: 'MiniMax-M2.1',
-    haiku: 'MiniMax-M2.1',
-  },
-  // OpenRouter — keeps Claude names, provider handles routing
-  'https://openrouter.ai/api': {
-    sonnet: 'Sonnet 4.5',
-    opus: 'Opus 4.6',
-    haiku: 'Haiku 4.5',
-  },
-};
 
 /**
  * Convert a data URL to a FileAttachment object.
@@ -226,7 +209,7 @@ function FileAwareSubmitButton({
       className="rounded-full"
     >
       {isStreaming ? (
-        <SquareIcon className="size-4" />
+        <HugeiconsIcon icon={StopIcon} className="size-4" />
       ) : (
         <HugeiconsIcon icon={ArrowUp02Icon} className="h-4 w-4" strokeWidth={2} />
       )}
@@ -239,15 +222,98 @@ function FileAwareSubmitButton({
  */
 function AttachFileButton() {
   const attachments = usePromptInputAttachments();
+  const { t } = useTranslation();
 
   return (
     <PromptInputButton
       onClick={() => attachments.openFileDialog()}
-      tooltip="Attach files"
+      tooltip={t('messageInput.attachFiles')}
     >
-      <HugeiconsIcon icon={Attachment01Icon} className="h-3.5 w-3.5" />
+      <HugeiconsIcon icon={PlusSignIcon} className="h-3.5 w-3.5" />
     </PromptInputButton>
   );
+}
+
+/**
+ * Infer a MIME type from a filename extension so that files added from the
+ * file tree pass the PromptInput accept-type validation.  Code / text files
+ * are mapped to `text/*` subtypes; images and PDFs get their standard types.
+ * Falls back to `application/octet-stream` for unknown extensions.
+ */
+function mimeFromFilename(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() || '';
+  const TEXT_EXTS: Record<string, string> = {
+    md: 'text/markdown', mdx: 'text/markdown',
+    txt: 'text/plain', csv: 'text/csv',
+    json: 'application/json',
+    ts: 'text/typescript', tsx: 'text/typescript',
+    js: 'text/javascript', jsx: 'text/javascript',
+    py: 'text/x-python', go: 'text/x-go', rs: 'text/x-rust',
+    rb: 'text/x-ruby', java: 'text/x-java', c: 'text/x-c',
+    cpp: 'text/x-c++', h: 'text/x-c', hpp: 'text/x-c++',
+    cs: 'text/x-csharp', swift: 'text/x-swift', kt: 'text/x-kotlin',
+    html: 'text/html', css: 'text/css', scss: 'text/css',
+    xml: 'text/xml', yaml: 'text/yaml', yml: 'text/yaml',
+    toml: 'text/plain', ini: 'text/plain', cfg: 'text/plain',
+    sh: 'text/x-shellscript', bash: 'text/x-shellscript', zsh: 'text/x-shellscript',
+    sql: 'text/x-sql', graphql: 'text/plain', gql: 'text/plain',
+    vue: 'text/plain', svelte: 'text/plain', astro: 'text/plain',
+    env: 'text/plain', gitignore: 'text/plain', dockerignore: 'text/plain',
+    dockerfile: 'text/plain', makefile: 'text/plain',
+    log: 'text/plain', lock: 'text/plain',
+  };
+  const IMAGE_EXTS: Record<string, string> = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+    gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+  };
+  if (TEXT_EXTS[ext]) return TEXT_EXTS[ext];
+  if (IMAGE_EXTS[ext]) return IMAGE_EXTS[ext];
+  if (ext === 'pdf') return 'application/pdf';
+  return 'application/octet-stream';
+}
+
+/**
+ * Bridge component that listens for 'attach-file-to-chat' custom events
+ * from the file tree and adds files as attachments. Must be rendered inside PromptInput.
+ */
+function FileTreeAttachmentBridge() {
+  const attachments = usePromptInputAttachments();
+  const attachmentsRef = useRef(attachments);
+
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+
+  useEffect(() => {
+    const handler = async (e: Event) => {
+      const customEvent = e as CustomEvent<{ path: string }>;
+      const filePath = customEvent.detail?.path;
+      if (!filePath) return;
+
+      try {
+        const res = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`);
+        if (!res.ok) {
+          console.warn(`[FileTreeAttachment] Failed to fetch file: ${res.status} ${res.statusText}`, filePath);
+          return;
+        }
+        const blob = await res.blob();
+        // Handle both Unix (/) and Windows (\) path separators
+        const filename = filePath.split(/[/\\]/).pop() || 'file';
+        // Use a proper MIME type derived from the extension so the file
+        // passes PromptInput's accept-type validation (text/* etc.)
+        const mime = mimeFromFilename(filename);
+        const file = new File([blob], filename, { type: mime });
+        attachmentsRef.current.add([file]);
+      } catch (err) {
+        console.warn('[FileTreeAttachment] Error attaching file:', filePath, err);
+      }
+    };
+
+    window.addEventListener('attach-file-to-chat', handler);
+    return () => window.removeEventListener('attach-file-to-chat', handler);
+  }, []);
+
+  return null;
 }
 
 /**
@@ -294,6 +360,7 @@ function FileAttachmentsCapsules() {
 
 export function MessageInput({
   onSend,
+  onImageGenerate,
   onCommand,
   onStop,
   disabled,
@@ -301,15 +368,17 @@ export function MessageInput({
   sessionId,
   modelName,
   onModelChange,
+  providerId,
+  onProviderModelChange,
   workingDirectory,
-  onWorkingDirectoryChange,
   mode = 'code',
   onModeChange,
 }: MessageInputProps) {
+  const { t } = useTranslation();
+  const imageGen = useImageGen();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const modeMenuRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
   const [popoverMode, setPopoverMode] = useState<PopoverMode>(null);
@@ -317,39 +386,56 @@ export function MessageInput({
   const [popoverFilter, setPopoverFilter] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [triggerPos, setTriggerPos] = useState<number | null>(null);
-  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
-  const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
   const [badge, setBadge] = useState<CommandBadge | null>(null);
-  const [activeProviderBaseUrl, setActiveProviderBaseUrl] = useState<string | null>(null);
-  const [activeProviderName, setActiveProviderName] = useState<string | null>(null);
+  const [providerGroups, setProviderGroups] = useState<ProviderModelGroup[]>([]);
+  const [defaultProviderId, setDefaultProviderId] = useState<string>('');
+  const [aiSuggestions, setAiSuggestions] = useState<PopoverItem[]>([]);
+  const [aiSearchLoading, setAiSearchLoading] = useState(false);
+  const aiSearchAbortRef = useRef<AbortController | null>(null);
+  const aiSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Fetch active provider to adapt model labels
-  useEffect(() => {
-    fetch('/api/providers')
+  // Fetch provider groups from API
+  const fetchProviderModels = useCallback(() => {
+    fetch('/api/providers/models')
       .then((r) => r.json())
       .then((data) => {
-        const active = (data.providers || []).find((p: { is_active: number }) => p.is_active === 1);
-        if (active) {
-          setActiveProviderBaseUrl(active.base_url || null);
-          setActiveProviderName(active.name || null);
+        if (data.groups && data.groups.length > 0) {
+          setProviderGroups(data.groups);
         } else {
-          setActiveProviderBaseUrl(null);
-          setActiveProviderName(null);
+          setProviderGroups([{
+            provider_id: 'env',
+            provider_name: 'Anthropic',
+            provider_type: 'anthropic',
+            models: DEFAULT_MODEL_OPTIONS,
+          }]);
         }
+        setDefaultProviderId(data.default_provider_id || '');
       })
-      .catch(() => {});
+      .catch(() => {
+        setProviderGroups([{
+          provider_id: 'env',
+          provider_name: 'Anthropic',
+          provider_type: 'anthropic',
+          models: DEFAULT_MODEL_OPTIONS,
+        }]);
+        setDefaultProviderId('');
+      });
   }, []);
 
-  // Compute model options based on active provider
-  const MODEL_OPTIONS = DEFAULT_MODEL_OPTIONS.map((opt) => {
-    if (activeProviderBaseUrl && PROVIDER_MODEL_LABELS[activeProviderBaseUrl]) {
-      const label = PROVIDER_MODEL_LABELS[activeProviderBaseUrl][opt.value];
-      if (label) return { ...opt, label };
-    }
-    return opt;
-  });
+  // Load models on mount and listen for provider changes
+  useEffect(() => {
+    fetchProviderModels();
+    const handler = () => fetchProviderModels();
+    window.addEventListener('provider-changed', handler);
+    return () => window.removeEventListener('provider-changed', handler);
+  }, [fetchProviderModels]);
+
+  // Derive flat model list for current provider (used by currentModelOption lookup)
+  const currentProviderIdValue = providerId || defaultProviderId || (providerGroups[0]?.provider_id ?? '');
+  const currentGroup = providerGroups.find(g => g.provider_id === currentProviderIdValue) || providerGroups[0];
+  const MODEL_OPTIONS = currentGroup?.models || DEFAULT_MODEL_OPTIONS;
 
   // Fetch files for @ mention
   const fetchFiles = useCallback(async (filter: string) => {
@@ -380,17 +466,19 @@ export function MessageInput({
   const fetchSkills = useCallback(async () => {
     let apiSkills: PopoverItem[] = [];
     try {
-      const res = await fetch('/api/skills');
+      const cwdParam = workingDirectory ? `?cwd=${encodeURIComponent(workingDirectory)}` : '';
+      const res = await fetch(`/api/skills${cwdParam}`);
       if (res.ok) {
         const data = await res.json();
         const skills = data.skills || [];
         apiSkills = skills
-          .map((s: { name: string; description: string; source?: string; installedSource?: "agents" | "claude" }) => ({
+          .map((s: { name: string; description: string; source?: "global" | "project" | "plugin" | "installed"; installedSource?: "agents" | "claude" }) => ({
             label: s.name,
             value: `/${s.name}`,
             description: s.description || "",
             builtIn: false,
             installedSource: s.installedSource,
+            source: s.source,
           }));
       }
     } catch {
@@ -402,7 +490,7 @@ export function MessageInput({
     const uniqueSkills = apiSkills.filter(s => !builtInNames.has(s.label));
 
     return [...BUILT_IN_COMMANDS, ...uniqueSkills];
-  }, []);
+  }, [workingDirectory]);
 
   // Close popover
   const closePopover = useCallback(() => {
@@ -411,6 +499,17 @@ export function MessageInput({
     setPopoverFilter('');
     setSelectedIndex(0);
     setTriggerPos(null);
+    // Clean up AI search state
+    setAiSuggestions([]);
+    setAiSearchLoading(false);
+    if (aiSearchTimerRef.current) {
+      clearTimeout(aiSearchTimerRef.current);
+      aiSearchTimerRef.current = null;
+    }
+    if (aiSearchAbortRef.current) {
+      aiSearchAbortRef.current.abort();
+      aiSearchAbortRef.current = null;
+    }
   }, []);
 
   // Remove active badge
@@ -520,12 +619,7 @@ export function MessageInput({
             file.filename || 'file',
             file.mediaType || 'application/octet-stream',
           );
-          // Enforce per-type size limits
-          const isImage = attachment.type.startsWith('image/');
-          const sizeLimit = isImage ? MAX_IMAGE_SIZE : MAX_DOC_SIZE;
-          if (attachment.size <= sizeLimit) {
-            attachments.push(attachment);
-          }
+          attachments.push(attachment);
         } catch {
           // Skip files that fail conversion
         }
@@ -533,18 +627,39 @@ export function MessageInput({
       return attachments;
     };
 
+    // If Image Agent toggle is on and no badge, send via normal LLM with systemPromptAppend
+    if (imageGen.state.enabled && !badge && !isStreaming) {
+      const files = await convertFiles();
+      if (!content && files.length === 0) return;
+
+      // Store uploaded images as pending reference images for ImageGenConfirmation
+      const imageFiles = files.filter(f => f.type.startsWith('image/'));
+      if (imageFiles.length > 0) {
+        setRefImages(PENDING_KEY, imageFiles.map(f => ({ mimeType: f.type, data: f.data })));
+      } else {
+        deleteRefImages(PENDING_KEY);
+      }
+
+      setInputValue('');
+      if (onSend) {
+        onSend(content, files.length > 0 ? files : undefined, IMAGE_AGENT_SYSTEM_PROMPT);
+      }
+      return;
+    }
+
     // If badge is active, expand the command/skill and send
-    if (badge) {
+    if (badge && !isStreaming) {
       let expandedPrompt = '';
 
       if (badge.isSkill) {
         // Fetch skill content from API
         try {
-          const sourceParam = badge.installedSource
-            ? `?source=${badge.installedSource}`
-            : "";
+          const detailParams = new URLSearchParams();
+          if (badge.installedSource) detailParams.set("source", badge.installedSource);
+          if (workingDirectory) detailParams.set("cwd", workingDirectory);
+          const qs = detailParams.toString();
           const res = await fetch(
-            `/api/skills/${encodeURIComponent(badge.label)}${sourceParam}`
+            `/api/skills/${encodeURIComponent(badge.label)}${qs ? `?${qs}` : ""}`
           );
           if (res.ok) {
             const data = await res.json();
@@ -572,7 +687,7 @@ export function MessageInput({
     const files = await convertFiles();
     const hasFiles = files.length > 0;
 
-    if ((!content && !hasFiles) || disabled) return;
+    if ((!content && !hasFiles) || disabled || isStreaming) return;
 
     // Check if it's a direct slash command typed in the input
     if (content.startsWith('/') && !hasFiles) {
@@ -610,7 +725,110 @@ export function MessageInput({
 
     onSend(content || 'Please review the attached file(s).', hasFiles ? files : undefined);
     setInputValue('');
-  }, [inputValue, onSend, onCommand, disabled, closePopover, badge]);
+  }, [inputValue, onSend, onImageGenerate, onCommand, disabled, isStreaming, closePopover, badge, imageGen]);
+
+  const filteredItems = popoverItems.filter((item) => {
+    const q = popoverFilter.toLowerCase();
+    return item.label.toLowerCase().includes(q)
+      || (item.description || '').toLowerCase().includes(q);
+  });
+
+  // Debounced AI semantic search when substring results are insufficient
+  const nonBuiltInFilteredCount = filteredItems.filter(i => !i.builtIn).length;
+  useEffect(() => {
+    // Only trigger for skill mode with enough input and few substring matches
+    if (popoverMode !== 'skill' || popoverFilter.length < 2 || nonBuiltInFilteredCount >= 2) {
+      setAiSuggestions([]);
+      setAiSearchLoading(false);
+      if (aiSearchTimerRef.current) {
+        clearTimeout(aiSearchTimerRef.current);
+        aiSearchTimerRef.current = null;
+      }
+      if (aiSearchAbortRef.current) {
+        aiSearchAbortRef.current.abort();
+        aiSearchAbortRef.current = null;
+      }
+      return;
+    }
+
+    // Cancel previous timer and request
+    if (aiSearchTimerRef.current) {
+      clearTimeout(aiSearchTimerRef.current);
+    }
+    if (aiSearchAbortRef.current) {
+      aiSearchAbortRef.current.abort();
+    }
+
+    setAiSearchLoading(true);
+
+    aiSearchTimerRef.current = setTimeout(async () => {
+      const abortController = new AbortController();
+      aiSearchAbortRef.current = abortController;
+
+      try {
+        // Collect non-built-in skills for AI search
+        const skillsPayload = popoverItems
+          .filter(i => !i.builtIn)
+          .map(i => ({ name: i.label, description: (i.description || '').slice(0, 100) }));
+
+        if (skillsPayload.length === 0) {
+          setAiSearchLoading(false);
+          return;
+        }
+
+        const res = await fetch('/api/skills/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: abortController.signal,
+          body: JSON.stringify({
+            query: popoverFilter,
+            skills: skillsPayload,
+            model: modelName || 'haiku',
+          }),
+        });
+
+        if (abortController.signal.aborted) return;
+
+        if (!res.ok) {
+          setAiSuggestions([]);
+          setAiSearchLoading(false);
+          return;
+        }
+
+        const data = await res.json();
+        const suggestions: string[] = data.suggestions || [];
+
+        // Map suggested names back to PopoverItems, deduplicating against substring results
+        const filteredNames = new Set(filteredItems.map(i => i.label));
+        const aiItems = suggestions
+          .filter(name => !filteredNames.has(name))
+          .map(name => popoverItems.find(i => i.label === name))
+          .filter((item): item is PopoverItem => !!item);
+
+        setAiSuggestions(aiItems);
+      } catch {
+        // Silently fail — don't show AI suggestions on error
+        if (!abortController.signal.aborted) {
+          setAiSuggestions([]);
+        }
+      } finally {
+        if (!abortController.signal.aborted) {
+          setAiSearchLoading(false);
+        }
+      }
+    }, 500);
+
+    return () => {
+      if (aiSearchTimerRef.current) {
+        clearTimeout(aiSearchTimerRef.current);
+        aiSearchTimerRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [popoverFilter, popoverMode, nonBuiltInFilteredCount]);
+
+  // Combined list for keyboard navigation
+  const allDisplayedItems = [...filteredItems, ...aiSuggestions];
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -618,18 +836,18 @@ export function MessageInput({
       if (popoverMode && popoverItems.length > 0) {
         if (e.key === 'ArrowDown') {
           e.preventDefault();
-          setSelectedIndex((prev) => (prev + 1) % filteredItems.length);
+          setSelectedIndex((prev) => (prev + 1) % allDisplayedItems.length);
           return;
         }
         if (e.key === 'ArrowUp') {
           e.preventDefault();
-          setSelectedIndex((prev) => (prev - 1 + filteredItems.length) % filteredItems.length);
+          setSelectedIndex((prev) => (prev - 1 + allDisplayedItems.length) % allDisplayedItems.length);
           return;
         }
         if (e.key === 'Enter' || e.key === 'Tab') {
           e.preventDefault();
-          if (filteredItems[selectedIndex]) {
-            insertItem(filteredItems[selectedIndex]);
+          if (allDisplayedItems[selectedIndex]) {
+            insertItem(allDisplayedItems[selectedIndex]);
           }
           return;
         }
@@ -654,7 +872,7 @@ export function MessageInput({
         return;
       }
     },
-    [popoverMode, popoverItems, popoverFilter, selectedIndex, insertItem, closePopover, badge, inputValue, removeBadge]
+    [popoverMode, popoverItems, popoverFilter, selectedIndex, insertItem, closePopover, badge, inputValue, removeBadge, allDisplayedItems]
   );
 
   // Click outside to close popover
@@ -669,18 +887,6 @@ export function MessageInput({
     return () => document.removeEventListener('mousedown', handler);
   }, [popoverMode, closePopover]);
 
-  // Click outside to close mode menu
-  useEffect(() => {
-    if (!modeMenuOpen) return;
-    const handler = (e: MouseEvent) => {
-      if (modeMenuRef.current && !modeMenuRef.current.contains(e.target as Node)) {
-        setModeMenuOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [modeMenuOpen]);
-
   // Click outside to close model menu
   useEffect(() => {
     if (!modelMenuOpen) return;
@@ -693,17 +899,8 @@ export function MessageInput({
     return () => document.removeEventListener('mousedown', handler);
   }, [modelMenuOpen]);
 
-  const filteredItems = popoverItems.filter((item) =>
-    item.label.toLowerCase().includes(popoverFilter.toLowerCase())
-  );
-
   const currentModelValue = modelName || 'sonnet';
   const currentModelOption = MODEL_OPTIONS.find((m) => m.value === currentModelValue) || MODEL_OPTIONS[0];
-  const currentMode = MODE_OPTIONS.find((m) => m.value === mode) || MODE_OPTIONS[0];
-
-  const folderShortName = workingDirectory
-    ? workingDirectory.split('/').filter(Boolean).pop() || workingDirectory
-    : '';
 
   // Map isStreaming to ChatStatus for PromptInputSubmit
   const chatStatus: ChatStatus = isStreaming ? 'streaming' : 'ready';
@@ -713,9 +910,10 @@ export function MessageInput({
       <div className="mx-auto">
         <div className="relative">
           {/* Popover */}
-          {popoverMode && filteredItems.length > 0 && (() => {
+          {popoverMode && (allDisplayedItems.length > 0 || aiSearchLoading) && (() => {
             const builtInItems = filteredItems.filter(item => item.builtIn);
-            const skillItems = filteredItems.filter(item => !item.builtIn);
+            const projectItems = filteredItems.filter(item => !item.builtIn && item.source === 'project');
+            const skillItems = filteredItems.filter(item => !item.builtIn && item.source !== 'project');
             let globalIdx = 0;
 
             const renderItem = (item: PopoverItem, idx: number) => (
@@ -733,15 +931,17 @@ export function MessageInput({
                   <HugeiconsIcon icon={AtIcon} className="h-4 w-4 shrink-0 text-muted-foreground" />
                 ) : item.builtIn && item.icon ? (
                   <HugeiconsIcon icon={item.icon} className="h-4 w-4 shrink-0 text-muted-foreground" />
+                ) : !item.builtIn && item.source === 'project' ? (
+                  <HugeiconsIcon icon={FileEditIcon} className="h-4 w-4 shrink-0 text-muted-foreground" />
                 ) : !item.builtIn ? (
                   <HugeiconsIcon icon={GlobalIcon} className="h-4 w-4 shrink-0 text-muted-foreground" />
                 ) : (
                   <HugeiconsIcon icon={CommandLineIcon} className="h-4 w-4 shrink-0 text-muted-foreground" />
                 )}
                 <span className="font-mono text-xs truncate">{item.label}</span>
-                {item.description && (
+                {(item.descriptionKey || item.description) && (
                   <span className="text-xs text-muted-foreground truncate max-w-[200px]">
-                    {item.description}
+                    {item.descriptionKey ? t(item.descriptionKey) : item.description}
                   </span>
                 )}
                 {!item.builtIn && item.installedSource && (
@@ -777,14 +977,14 @@ export function MessageInput({
                       onKeyDown={(e) => {
                         if (e.key === 'ArrowDown') {
                           e.preventDefault();
-                          setSelectedIndex((prev) => (prev + 1) % filteredItems.length);
+                          setSelectedIndex((prev) => (prev + 1) % allDisplayedItems.length);
                         } else if (e.key === 'ArrowUp') {
                           e.preventDefault();
-                          setSelectedIndex((prev) => (prev - 1 + filteredItems.length) % filteredItems.length);
+                          setSelectedIndex((prev) => (prev - 1 + allDisplayedItems.length) % allDisplayedItems.length);
                         } else if (e.key === 'Enter' || e.key === 'Tab') {
                           e.preventDefault();
-                          if (filteredItems[selectedIndex]) {
-                            insertItem(filteredItems[selectedIndex]);
+                          if (allDisplayedItems[selectedIndex]) {
+                            insertItem(allDisplayedItems[selectedIndex]);
                           }
                         } else if (e.key === 'Escape') {
                           e.preventDefault();
@@ -817,12 +1017,39 @@ export function MessageInput({
                           })}
                         </>
                       )}
+                      {projectItems.length > 0 && (
+                        <>
+                          <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                            Project Commands
+                          </div>
+                          {projectItems.map((item) => {
+                            const idx = globalIdx++;
+                            return renderItem(item, idx);
+                          })}
+                        </>
+                      )}
                       {skillItems.length > 0 && (
                         <>
                           <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
                             Skills
                           </div>
                           {skillItems.map((item) => {
+                            const idx = globalIdx++;
+                            return renderItem(item, idx);
+                          })}
+                        </>
+                      )}
+                      {/* AI Suggested section */}
+                      {(aiSuggestions.length > 0 || aiSearchLoading) && (
+                        <>
+                          <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                            <HugeiconsIcon icon={BrainIcon} className="h-3.5 w-3.5" />
+                            {t('messageInput.aiSuggested')}
+                            {aiSearchLoading && (
+                              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                            )}
+                          </div>
+                          {aiSuggestions.map((item) => {
                             const idx = globalIdx++;
                             return renderItem(item, idx);
                           })}
@@ -838,10 +1065,11 @@ export function MessageInput({
           {/* PromptInput replaces the old input area */}
           <PromptInput
             onSubmit={handleSubmit}
-            accept={ACCEPTED_FILE_TYPES}
+            accept=""
             multiple
-            maxFileSize={MAX_FILE_SIZE}
           >
+            {/* Bridge: listens for file tree "+" button events */}
+            <FileTreeAttachmentBridge />
             {/* Command badge */}
             {badge && (
               <div className="flex w-full items-center gap-1.5 px-3 pt-2.5 pb-0 order-first">
@@ -870,7 +1098,7 @@ export function MessageInput({
               value={inputValue}
               onChange={(e) => handleInputChange(e.currentTarget.value)}
               onKeyDown={handleKeyDown}
-              disabled={disabled || isStreaming}
+              disabled={disabled}
               className="min-h-10"
             />
             <PromptInputFooter>
@@ -878,62 +1106,27 @@ export function MessageInput({
                 {/* Attach file button */}
                 <AttachFileButton />
 
-                {/* Folder picker button */}
-                <PromptInputButton
-                  onClick={() => setFolderPickerOpen(true)}
-                  tooltip={workingDirectory || 'Select project folder'}
-                >
-                  <HugeiconsIcon icon={FolderOpenIcon} className="h-3.5 w-3.5" />
-                  <span className="max-w-[120px] truncate text-xs">
-                    {folderShortName || 'Folder'}
-                  </span>
-                </PromptInputButton>
-
-                {/* Mode selector */}
-                <div className="relative" ref={modeMenuRef}>
-                  <PromptInputButton
-                    onClick={() => setModeMenuOpen((prev) => !prev)}
-                  >
-                    <HugeiconsIcon icon={currentMode.icon} className="h-3.5 w-3.5" />
-                    <span className="text-xs">{currentMode.label}</span>
-                    <HugeiconsIcon icon={ArrowDown01Icon} className={cn("h-2.5 w-2.5 transition-transform duration-200", modeMenuOpen && "rotate-180")} />
-                  </PromptInputButton>
-
-                  {/* Mode dropdown */}
-                  {modeMenuOpen && (
-                    <div className="absolute bottom-full left-0 mb-1.5 w-56 rounded-lg border bg-popover shadow-lg overflow-hidden z-50">
-                      <div className="py-1">
-                        {MODE_OPTIONS.map((opt) => {
-                          const isActive = opt.value === mode;
-                          return (
-                            <button
-                              key={opt.value}
-                              className={cn(
-                                "flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors",
-                                isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-                              )}
-                              onClick={() => {
-                                onModeChange?.(opt.value);
-                                setModeMenuOpen(false);
-                              }}
-                            >
-                              <HugeiconsIcon icon={opt.icon} className="h-4 w-4 shrink-0" />
-                              <div className="flex flex-col min-w-0">
-                                <span className="font-medium text-xs">{opt.label}</span>
-                                <span className="text-[10px] text-muted-foreground truncate">
-                                  {opt.description}
-                                </span>
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
+                {/* Mode capsule toggle */}
+                <div className="flex items-center rounded-full border border-border/60 overflow-hidden h-7">
+                  {MODE_OPTIONS.map((opt) => {
+                    const isActive = opt.value === mode;
+                    return (
+                      <button
+                        key={opt.value}
+                        className={cn(
+                          "px-2.5 py-1 text-xs font-medium transition-colors",
+                          isActive
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted-foreground hover:text-foreground"
+                        )}
+                        onClick={() => onModeChange?.(opt.value)}
+                      >
+                        {opt.value === 'code' ? t('messageInput.modeCode') : opt.value === 'plan' ? t('messageInput.modePlan') : opt.label}
+                      </button>
+                    );
+                  })}
                 </div>
-              </PromptInputTools>
 
-              <div className="flex items-center gap-1.5">
                 {/* Model selector */}
                 <div className="relative" ref={modelMenuRef}>
                   <PromptInputButton
@@ -944,53 +1137,63 @@ export function MessageInput({
                   </PromptInputButton>
 
                   {modelMenuOpen && (
-                    <div className="absolute bottom-full right-0 mb-1.5 w-48 rounded-lg border bg-popover shadow-lg overflow-hidden z-50">
-                      <div className="py-1">
-                        {MODEL_OPTIONS.map((opt) => {
-                          const isActive = opt.value === currentModelValue;
-                          return (
-                            <button
-                              key={opt.value}
-                              className={cn(
-                                "flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors",
-                                isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-                              )}
-                              onClick={() => {
-                                onModelChange?.(opt.value);
-                                setModelMenuOpen(false);
-                              }}
-                            >
-                              <span className="font-mono text-xs">{opt.label}</span>
-                            </button>
-                          );
-                        })}
-                      </div>
+                    <div className="absolute bottom-full left-0 mb-1.5 w-52 rounded-lg border bg-popover shadow-lg overflow-hidden z-50 max-h-80 overflow-y-auto">
+                      {providerGroups.map((group, groupIdx) => (
+                        <div key={group.provider_id}>
+                          {/* Group header */}
+                          <div className={cn(
+                            "px-3 py-1.5 text-[10px] font-medium text-muted-foreground",
+                            groupIdx > 0 && "border-t"
+                          )}>
+                            {group.provider_name}
+                          </div>
+                          {/* Models in group */}
+                          <div className="py-0.5">
+                            {group.models.map((opt) => {
+                              const isActive = opt.value === currentModelValue && group.provider_id === currentProviderIdValue;
+                              return (
+                                <button
+                                  key={`${group.provider_id}-${opt.value}`}
+                                  className={cn(
+                                    "flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-sm transition-colors",
+                                    isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
+                                  )}
+                                  onClick={() => {
+                                    onModelChange?.(opt.value);
+                                    onProviderModelChange?.(group.provider_id, opt.value);
+                                    localStorage.setItem('codepilot:last-model', opt.value);
+                                    localStorage.setItem('codepilot:last-provider-id', group.provider_id);
+                                    setModelMenuOpen(false);
+                                  }}
+                                >
+                                  <span className="font-mono text-xs">{opt.label}</span>
+                                  {isActive && <span className="text-xs">✓</span>}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
 
-                <FileAwareSubmitButton
-                  status={chatStatus}
-                  onStop={onStop}
-                  disabled={disabled}
-                  inputValue={inputValue}
-                  hasBadge={!!badge}
-                />
-              </div>
+                {/* Image Agent toggle */}
+                <ImageGenToggle />
+              </PromptInputTools>
+
+              <FileAwareSubmitButton
+                status={chatStatus}
+                onStop={onStop}
+                disabled={disabled}
+                inputValue={inputValue}
+                hasBadge={!!badge}
+              />
             </PromptInputFooter>
           </PromptInput>
         </div>
       </div>
 
-      {/* FolderPicker dialog */}
-      <FolderPicker
-        open={folderPickerOpen}
-        onOpenChange={setFolderPickerOpen}
-        onSelect={(dir) => {
-          onWorkingDirectoryChange?.(dir);
-        }}
-        initialPath={workingDirectory || undefined}
-      />
     </div>
   );
 }
